@@ -1,0 +1,48 @@
+# SSH backend node setup
+
+This document configures one DN42 node for `BACKEND = "ssh"` mode.
+
+## 1) Create SSH user
+
+```bash
+sudo useradd -m -s /bin/bash dn42bot
+sudo mkdir -p /home/dn42bot/.ssh
+sudo chmod 700 /home/dn42bot/.ssh
+sudo chown -R dn42bot:dn42bot /home/dn42bot/.ssh
+```
+
+Add your bot server public key to `/home/dn42bot/.ssh/authorized_keys` and set permission:
+
+```bash
+sudo chmod 600 /home/dn42bot/.ssh/authorized_keys
+sudo chown dn42bot:dn42bot /home/dn42bot/.ssh/authorized_keys
+```
+
+## 2) Install node command script
+
+```bash
+sudo install -m 0755 deploy/node/dn42-agentctl /usr/local/sbin/dn42-agentctl
+sudo mkdir -p /etc/dn42-agentctl
+sudo cp deploy/node/dn42-agentctl.example.json /etc/dn42-agentctl/config.json
+```
+
+Edit `/etc/dn42-agentctl/config.json` with real node values.
+
+## 3) Restrict sudo permission
+
+```bash
+sudo cp deploy/node/sudoers.dn42bot.example /etc/sudoers.d/dn42bot
+sudo visudo -c
+```
+
+The `dn42bot` user can only run:
+
+```text
+/usr/local/sbin/dn42-agentctl
+```
+
+## 4) Quick health check from bot server
+
+```bash
+ssh -i /path/to/id_ed25519 dn42bot@node.example.com "sudo /usr/local/sbin/dn42-agentctl version" <<< ""
+```

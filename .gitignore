@@ -1,0 +1,25 @@
+# Local configuration and secrets
+server/config.py
+agent/agent_config.json
+*.env
+*.pem
+*.key
+id_*
+
+# Runtime state
+server/*.pkl
+server/dn42-registry/
+*.log
+
+# Python cache and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Build and editor noise
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.DS_Store
+Thumbs.db

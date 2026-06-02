@@ -1,0 +1,5 @@
+# /etc/sudoers.d/dn42bot
+# Use visudo -f /etc/sudoers.d/dn42bot
+
+Defaults:dn42bot !requiretty
+dn42bot ALL=(root) NOPASSWD: /usr/local/sbin/dn42-agentctl

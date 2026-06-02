@@ -1,0 +1,499 @@
+#!/usr/bin/env python3
+
+import json
+import os
+import re
+import shlex
+import socket
+import subprocess
+import sys
+from ipaddress import IPv4Network, IPv6Network, ip_address
+
+
+AGENT_VERSION = 27
+WG_DIR = "/etc/wireguard"
+BIRD_PEER_DIR = "/etc/bird/dn42_peers"
+WG_PRIVATE_KEY_PATH = "/etc/wireguard/dn42-privatekey"
+DEFAULT_CONFIG_PATH = "/etc/dn42-agentctl/config.json"
+
+
+def simple_run(command, timeout=3):
+    try:
+        output = (
+            subprocess.check_output(shlex.split(command), timeout=timeout, stderr=subprocess.STDOUT)
+            .decode("utf-8")
+            .strip()
+        )
+    except subprocess.CalledProcessError as exc:
+        output = exc.output.decode("utf-8").strip()
+    return output
+
+
+def out(status, body=""):
+    sys.stdout.write(json.dumps({"status": status, "body": body}, ensure_ascii=False))
+
+
+def load_config():
+    config_path = os.environ.get("DN42_AGENTCTL_CONFIG", DEFAULT_CONFIG_PATH)
+    with open(config_path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    return {
+        "OPEN": bool(raw["OPEN"]),
+        "MAX_PEERS": int(raw["MAX_PEERS"]) if int(raw["MAX_PEERS"]) > 0 else 0,
+        "MIN_PEER_REQUIREMENT": int(raw["MIN_PEER_REQUIREMENT"]) if int(raw["MIN_PEER_REQUIREMENT"]) > 0 else 0,
+        "NET_SUPPORT": raw["NET_SUPPORT"],
+        "EXTRA_MSG": raw["EXTRA_MSG"],
+        "MY_DN42_LINK_LOCAL_ADDRESS": ip_address(raw["MY_DN42_LINK_LOCAL_ADDRESS"]),
+        "MY_DN42_ULA_ADDRESS": ip_address(raw["MY_DN42_ULA_ADDRESS"]),
+        "MY_DN42_IPv4_ADDRESS": ip_address(raw["MY_DN42_IPv4_ADDRESS"]),
+        "MY_WG_PUBLIC_KEY": raw["MY_WG_PUBLIC_KEY"],
+        "BIRD_TABLE_4": raw["BIRD_TABLE_4"],
+        "BIRD_TABLE_6": raw["BIRD_TABLE_6"],
+        "VNSTAT_AUTO_ADD": bool(raw["VNSTAT_AUTO_ADD"]),
+        "VNSTAT_AUTO_REMOVE": bool(raw["VNSTAT_AUTO_REMOVE"]) if bool(raw["VNSTAT_AUTO_ADD"]) else False,
+    }
+
+
+def get_current_peer_num():
+    wg_conf = [i[5:-5] for i in os.listdir(WG_DIR) if i.startswith("dn42-") and i.endswith(".conf")]
+    bird_conf = [i[:-5] for i in os.listdir(BIRD_PEER_DIR) if i.endswith(".conf")]
+    wg_conf_len = len([i for i in wg_conf if i.isdigit()])
+    bird_conf_len = len([i for i in bird_conf if i.isdigit()])
+    return min(wg_conf_len, bird_conf_len)
+
+
+def act_version(_, __):
+    return 200, str(AGENT_VERSION)
+
+
+def act_pre_peer(_, cfg):
+    current_peer_num = get_current_peer_num()
+    return (
+        200,
+        json.dumps(
+            {
+                "existed": current_peer_num,
+                "max": cfg["MAX_PEERS"],
+                "requirement": cfg["MIN_PEER_REQUIREMENT"],
+                "open": cfg["OPEN"],
+                "net_support": cfg["NET_SUPPORT"],
+                "lla": str(cfg["MY_DN42_LINK_LOCAL_ADDRESS"]),
+                "msg": cfg["EXTRA_MSG"],
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+
+def act_info(payload, cfg):
+    try:
+        asn = int(payload.strip())
+    except ValueError:
+        return 400, ""
+
+    wg_exist = os.path.isfile(f"{WG_DIR}/dn42-{asn}.conf")
+    bird_exist = os.path.isfile(f"{BIRD_PEER_DIR}/{asn}.conf")
+    if not wg_exist and not bird_exist:
+        return 404, ""
+    if wg_exist and not bird_exist:
+        return 500, "wg only"
+    if not wg_exist and bird_exist:
+        return 500, "bird only"
+
+    wg_regex = (
+        r"\[Interface\]\n"
+        r"ListenPort = ([0-9]+)\n"
+        r"Table = off\n"
+        r"(?:MTU = [0-9]+\n)?"
+        rf"PostUp = wg set %i private-key {re.escape(WG_PRIVATE_KEY_PATH)}\n"
+        r"PostUp = ip addr add (fe80::[0-9a-f:]+)/64(?: peer (fe80::[0-9a-f:]+)/64)? dev %i\n"
+        rf"PostUp = ip addr add {re.escape(str(cfg['MY_DN42_ULA_ADDRESS']))}/128(?: peer (f[cd][0-9a-f:]+)/128)? dev %i\n"
+        rf"PostUp = ip addr add {re.escape(str(cfg['MY_DN42_IPv4_ADDRESS']))}/32(?: peer ([0-9.]+)/32)? dev %i\n"
+        r"PostUp = sysctl -w net\.ipv6\.conf\.%i\.autoconf=0\n\n"
+        r"\[Peer\]\n"
+        r"PublicKey = (.{43}=)\n"
+        r"(?:Endpoint = (.+:[0-9]{,5})\n)?"
+        r"AllowedIPs = "
+    )
+    bird_regex_v4 = rf"protocol bgp DN42_{asn}_v4 from dn42_peers \{{\n(?:(?: +.*?\n)*?.*\n)+?\}}"
+    bird_regex_v4_only = (
+        r" {4}ipv6 \{\n"
+        r"(?: {4,}.*?\n)*?"
+        r"(?:(?: {8}import none;\n(?: {4,}.*?\n)*? {8}export none;)|(?: {8}export none;\n(?: {4,}.*?\n)*? {8}import none;))\n"
+        r"(?: {4,}.*?\n)*?"
+        r" {4}\};"
+    )
+    bird_regex_v6 = rf"protocol bgp DN42_{asn}_v6 from dn42_peers \{{\n(?:(?: +.*?\n)*?.*\n)+?\}}"
+    bird_regex_v6_only = (
+        r" {4}ipv4 \{\n"
+        r"(?: {4,}.*?\n)*?"
+        r"(?:(?: {8}import none;\n(?: {4,}.*?\n)*? {8}export none;)|(?: {8}export none;\n(?: {4,}.*?\n)*? {8}import none;))\n"
+        r"(?: {4,}.*?\n)*?"
+        r" {4}\};"
+    )
+    bird_regex_desc = r'^ {4}description "(.*)";$'
+
+    with open(f"{WG_DIR}/dn42-{asn}.conf", "r", encoding="utf-8") as f:
+        wg_raw = f.read()
+    with open(f"{BIRD_PEER_DIR}/{asn}.conf", "r", encoding="utf-8") as f:
+        bird_raw = f.read()
+
+    match = re.search(wg_regex, wg_raw, re.MULTILINE)
+    if not match:
+        return 500, "wg error"
+    wg_info = match.groups()
+    if wg_info[2]:
+        v6 = wg_info[2]
+        my_v6 = wg_info[1]
+    else:
+        v6 = wg_info[3]
+        my_v6 = str(cfg["MY_DN42_ULA_ADDRESS"])
+    my_v4 = str(cfg["MY_DN42_IPv4_ADDRESS"]) if wg_info[4] else None
+    clearnet = wg_info[6] if wg_info[6] else None
+
+    desc = "N.A."
+    session = ""
+    session_name = []
+    if matches := re.findall(bird_regex_v6, bird_raw, re.MULTILINE):
+        session_name.append(f"DN42_{asn}_v6")
+        if re.findall(bird_regex_v6_only, matches[0], re.MULTILINE):
+            session = "IPv6 Session with IPv6 channel only"
+        else:
+            session = "IPv6 Session with IPv6 & IPv4 Channels"
+        mdesc = re.search(bird_regex_desc, matches[0], re.MULTILINE)
+        if mdesc:
+            desc = mdesc.group(1)
+    if matches := re.findall(bird_regex_v4, bird_raw, re.MULTILINE):
+        session_name.append(f"DN42_{asn}_v4")
+        if re.findall(bird_regex_v4_only, matches[0], re.MULTILINE):
+            if session == "":
+                session += "IPv4 Session with IPv4 channel only"
+            elif session == "IPv6 Session with IPv6 channel only":
+                session = "IPv6 & IPv4 Session with their own channels"
+            else:
+                return 500, "session error"
+        else:
+            session = "IPv4 Session with IPv6 & IPv4 Channels"
+        mdesc = re.search(bird_regex_desc, matches[0], re.MULTILINE)
+        if mdesc:
+            desc = mdesc.group(1)
+    if not session_name:
+        return 500, "no session"
+
+    out_handshake = simple_run(f"wg show dn42-{asn} latest-handshakes")
+    if out_handshake:
+        if out_handshake == "Unable to access interface: No such device":
+            wg_last_handshake = 0
+        else:
+            sp = out_handshake.split()
+            if sp[0] != wg_info[5]:
+                return 500, "wg error"
+            wg_last_handshake = int(sp[1])
+    else:
+        wg_last_handshake = 0
+
+    out_transfer = simple_run(f"wg show dn42-{asn} transfer")
+    if out_transfer:
+        if out_transfer == "Unable to access interface: No such device":
+            wg_transfer = [0, 0]
+        else:
+            sp = out_transfer.split()
+            if sp[0] != wg_info[5]:
+                return 500, "wg error"
+            wg_transfer = [int(sp[1]), int(sp[2])]
+    else:
+        wg_transfer = [0, 0]
+
+    bird_status = {}
+    for the_session in session_name:
+        out = simple_run(f"birdc show protocols {the_session}").splitlines()
+        if len(out) != 3:
+            return 500, "bird error"
+        sp = out[2].strip().split(maxsplit=6)
+        if sp[0] != the_session:
+            return 500, "bird error"
+        bird_status[the_session] = [sp[5] if len(sp) >= 6 else "N/A", "", {}]
+        if len(sp) >= 7:
+            bird_status[the_session][1] = sp[6]
+        if len(sp) >= 6 and sp[5] == "Established":
+            raw = simple_run(f"birdc show protocols all {the_session}")
+            chunks = [i.strip().splitlines() for i in raw.split("Channel ")]
+            channels = {
+                i[0].strip(): {j.split(":", 1)[0].strip(): j.split(":", 1)[1].strip() for j in i[1:] if ":" in j}
+                for i in chunks
+                if i and i[0].strip().startswith("ipv")
+            }
+            for key, value in channels.items():
+                if value.get("State") == "UP" and value.get("Output filter") == "(unnamed)":
+                    bird_status[the_session][2][key[3]] = value.get("Routes", "N/A")
+
+    body = json.dumps(
+        {
+            "port": wg_info[0],
+            "v6": v6,
+            "v4": wg_info[4],
+            "clearnet": clearnet,
+            "pubkey": wg_info[5],
+            "desc": desc,
+            "session": session,
+            "session_name": session_name,
+            "my_v6": my_v6,
+            "my_v4": my_v4,
+            "my_pubkey": cfg["MY_WG_PUBLIC_KEY"],
+            "wg_last_handshake": wg_last_handshake,
+            "wg_transfer": wg_transfer,
+            "bird_status": bird_status,
+            "net_support": cfg["NET_SUPPORT"],
+            "lla": str(cfg["MY_DN42_LINK_LOCAL_ADDRESS"]),
+        },
+        ensure_ascii=False,
+    )
+    return 200, body
+
+
+def act_peer(payload, cfg):
+    try:
+        peer_info = json.loads(payload)
+    except json.JSONDecodeError:
+        return 400, ""
+
+    current_peer_num = get_current_peer_num()
+    if current_peer_num is None:
+        return 500, "wireguard and bird config not match"
+    if not (
+        os.path.exists(f"{WG_DIR}/dn42-{peer_info['ASN']}.conf")
+        and os.path.exists(f"{BIRD_PEER_DIR}/{peer_info['ASN']}.conf")
+    ) and ((cfg["MAX_PEERS"] != 0 and current_peer_num >= cfg["MAX_PEERS"]) or not cfg["OPEN"]):
+        return 503, ""
+
+    ula = None
+    ll = None
+    ipv4 = None
+    try:
+        if ip_address(peer_info["IPv6"]) in IPv6Network("fc00::/7"):
+            ula = str(ip_address(peer_info["IPv6"]))
+    except BaseException:
+        pass
+    try:
+        if ip_address(peer_info["IPv6"]) in IPv6Network("fe80::/64"):
+            ll = str(ip_address(peer_info["IPv6"]))
+    except BaseException:
+        pass
+    try:
+        if any(
+            ip_address(peer_info["IPv4"]) in n for n in [IPv4Network("172.20.0.0/14"), IPv4Network("10.127.0.0/16")]
+        ):
+            ipv4 = str(ip_address(peer_info["IPv4"]))
+    except BaseException:
+        pass
+    try:
+        my_lla = str(ip_address(peer_info["Request-LinkLocal"]))
+    except BaseException:
+        my_lla = str(cfg["MY_DN42_LINK_LOCAL_ADDRESS"])
+
+    wg = (
+        "# {comment}\n"
+        "[Interface]\n"
+        "ListenPort = {port}\n"
+        "Table = off\n"
+        "MTU = 1420\n"
+        f"PostUp = wg set %i private-key {WG_PRIVATE_KEY_PATH}\n"
+        "PostUp = ip addr add {my_lla}/64{ll} dev %i\n"
+        "PostUp = ip addr add {my_ula}/128{ula} dev %i\n"
+        "PostUp = ip addr add {my_ipv4}/32{ipv4} dev %i\n"
+        "PostUp = sysctl -w net.ipv6.conf.%i.autoconf=0\n"
+        "\n"
+        "[Peer]\n"
+        "PublicKey = {pubkey}\n"
+        "Endpoint = {clearnet}\n"
+        "AllowedIPs = 172.20.0.0/14, 10.0.0.0/8, 172.31.0.0/16, fd00::/8, fe80::/64\n"
+    )
+    final_wg_text = wg.format(
+        comment=f"{peer_info['ASN']} - {peer_info['Contact']}",
+        port=peer_info["Port"],
+        ll=(f" peer {ll}/64" if ll else ""),
+        ula=(f" peer {ula}/128" if ula else ""),
+        ipv4=(f" peer {ipv4}/32" if ipv4 else ""),
+        my_lla=my_lla,
+        my_ula=str(cfg["MY_DN42_ULA_ADDRESS"]),
+        my_ipv4=str(cfg["MY_DN42_IPv4_ADDRESS"]),
+        pubkey=peer_info["PublicKey"],
+        clearnet=peer_info["Clearnet"],
+    )
+    if peer_info["Clearnet"] is None:
+        final_wg_text = final_wg_text.replace("Endpoint = None\n", "")
+    with open(f"{WG_DIR}/dn42-{peer_info['ASN']}.conf", "w", encoding="utf-8") as f:
+        f.write(final_wg_text)
+
+    def gen_bird_protocol(version, only):
+        text = (
+            f"protocol bgp DN42_{peer_info['ASN']}_v{version} from dn42_peers "
+            "{\n"
+            f"    neighbor {peer_info[f'IPv{version}']} % 'dn42-{peer_info['ASN']}' external;\n"
+            f'    description "{peer_info["Contact"]}";\n'
+        )
+        if only is True:
+            if version == 6:
+                text += "    ipv4 {\n"
+            elif version == 4:
+                text += "    ipv6 {\n"
+            text += "        import none;\n" "        export none;\n" "    };\n"
+        text += "}\n"
+        return text
+
+    bird = ""
+    if peer_info["Channel"] == "IPv6 only":
+        bird = gen_bird_protocol(6, True)
+    elif peer_info["Channel"] == "IPv4 only":
+        bird = gen_bird_protocol(4, True)
+    elif peer_info["Channel"] == "IPv6 & IPv4":
+        if peer_info["MP-BGP"] == "IPv6":
+            bird = gen_bird_protocol(6, False)
+        elif peer_info["MP-BGP"] == "IPv4":
+            bird = gen_bird_protocol(4, False)
+        elif peer_info["MP-BGP"] == "Not supported":
+            bird = gen_bird_protocol(6, True) + "\n" + gen_bird_protocol(4, True)
+    with open(f"{BIRD_PEER_DIR}/{peer_info['ASN']}.conf", "w", encoding="utf-8") as f:
+        f.write(bird)
+
+    simple_run("systemctl daemon-reload")
+    simple_run(f"systemctl enable wg-quick@dn42-{peer_info['ASN']}")
+    simple_run(f"systemctl restart wg-quick@dn42-{peer_info['ASN']}")
+    simple_run("birdc c")
+    if cfg["VNSTAT_AUTO_ADD"]:
+        simple_run(f"vnstat --add -i dn42-{peer_info['ASN']}")
+    return 200, ""
+
+
+def act_remove(payload, cfg):
+    try:
+        asn = int(payload.strip())
+    except ValueError:
+        return 400, ""
+
+    simple_run(f"systemctl stop wg-quick@dn42-{asn}")
+    simple_run(f"systemctl disable wg-quick@dn42-{asn}")
+    try:
+        os.remove(f"{WG_DIR}/dn42-{asn}.conf")
+    except BaseException:
+        pass
+    try:
+        os.remove(f"{BIRD_PEER_DIR}/{asn}.conf")
+    except BaseException:
+        pass
+    simple_run("birdc c")
+    if cfg["VNSTAT_AUTO_REMOVE"]:
+        simple_run(f"vnstat --remove -i dn42-{asn} --force")
+    return 200, ""
+
+
+def act_restart(payload, _cfg):
+    try:
+        asn = int(payload.strip())
+    except ValueError:
+        return 400, ""
+
+    out_wg = simple_run(f"systemctl restart wg-quick@dn42-{asn}")
+    out_v4 = simple_run(f"birdc restart DN42_{asn}_v4")
+    out_v6 = simple_run(f"birdc restart DN42_{asn}_v6")
+    if "syntax error" in out_v4 and "syntax error" in out_v6:
+        if out_wg:
+            return 404, ""
+        return 500, "bird error"
+    if out_wg:
+        return 500, "wg error"
+    return 200, ""
+
+
+def act_ping(payload, _cfg):
+    target = payload.strip()
+    out = simple_run(f"ping -c 5 -w 6 {target}", timeout=8)
+    return 200, out
+
+
+def act_trace(payload, _cfg):
+    target = payload.strip()
+    try:
+        out = simple_run(f"traceroute -q1 -N32 -w1 {target}", timeout=8)
+    except subprocess.TimeoutExpired:
+        try:
+            out = simple_run(f"traceroute -q1 -N32 -w1 -n {target}", timeout=8)
+        except subprocess.TimeoutExpired:
+            raise
+    lines = [i for i in out.splitlines()[::-1] if not re.match(r"^\s*$", i)]
+    total = 0
+    while lines and re.match(r"^\s*\d+(?:\s+\*)+$", lines[0]):
+        lines.pop(0)
+        total += 1
+    body = "\n".join(lines[::-1])
+    if total > 0:
+        body += f"\n\n{total} hops not responding."
+    return 200, body
+
+
+def act_tcping(payload, _cfg):
+    target = payload.strip()
+    out = simple_run(f"tcping --no-color -c 5 {target}", timeout=10)
+    out = re.sub(r"\n\nPing (?:stopped|interrupted).\n\n", "\n", out)
+    return 200, out
+
+
+def act_route(payload, cfg):
+    target = payload.strip()
+    if ":" in target:
+        out = simple_run(f"birdc show route table {cfg['BIRD_TABLE_6']} for {target} all primary")
+    else:
+        out = simple_run(f"birdc show route table {cfg['BIRD_TABLE_4']} for {target} all primary")
+    return 200, out
+
+
+def act_path(payload, cfg):
+    status, body = act_route(payload, cfg)
+    for line in body.splitlines():
+        if "BGP.as_path" in line:
+            return 200, line.split(":", 1)[1].strip()
+    return 404, ""
+
+
+ACTIONS = {
+    "version": act_version,
+    "pre_peer": act_pre_peer,
+    "info": act_info,
+    "peer": act_peer,
+    "remove": act_remove,
+    "restart": act_restart,
+    "ping": act_ping,
+    "trace": act_trace,
+    "tcping": act_tcping,
+    "route": act_route,
+    "path": act_path,
+}
+
+
+def main():
+    if len(sys.argv) != 2:
+        out(400, "Usage: dn42-agentctl <action>")
+        return
+    action = sys.argv[1].strip()
+    if action not in ACTIONS:
+        out(400, f"Unsupported action: {action}")
+        return
+
+    payload = sys.stdin.read()
+    try:
+        cfg = load_config()
+    except BaseException as exc:
+        out(500, f"Failed to load config: {exc}")
+        return
+
+    try:
+        status, body = ACTIONS[action](payload, cfg)
+    except subprocess.TimeoutExpired:
+        status, body = 408, ""
+    except BaseException as exc:
+        status, body = 500, str(exc)
+    out(status, body)
+
+
+if __name__ == "__main__":
+    main()
