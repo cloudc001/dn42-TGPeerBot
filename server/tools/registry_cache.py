@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import threading
 import time
+from ipaddress import ip_network
 
 import config
 
@@ -165,6 +166,85 @@ def _parse_registry_file(path):
     return data
 
 
+def _read_registry_text(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read().strip()
+    except BaseException:
+        return None
+
+
+def _candidate_names(query):
+    query = str(query).strip()
+    if not query:
+        return []
+
+    candidates = [query, query.upper()]
+    upper = query.upper()
+    numeric = None
+    try:
+        if upper.startswith("AS"):
+            numeric = int(upper[2:])
+        else:
+            numeric = int(query)
+    except ValueError:
+        numeric = None
+
+    if numeric is not None:
+        candidates.append(f"AS{numeric}")
+        if not upper.startswith("AS"):
+            if numeric < 10000:
+                candidates.append(f"AS424242{numeric:04d}")
+            elif 20000 <= numeric < 30000:
+                candidates.append(f"AS42424{numeric}")
+
+    if "/" in query:
+        candidates.append(query.replace("/", "_"))
+        candidates.append(query.upper().replace("/", "_"))
+    else:
+        try:
+            network = ip_network(query, strict=False)
+            candidates.append(network.compressed.replace("/", "_"))
+        except ValueError:
+            pass
+
+    seen = set()
+    result = []
+    for candidate in candidates:
+        if candidate and candidate not in seen:
+            seen.add(candidate)
+            result.append(candidate)
+    return result
+
+
+def _candidate_object_dirs(candidate):
+    data_dir = os.path.join(_repo_dir(), "data")
+    if not os.path.isdir(data_dir):
+        return []
+
+    if candidate.startswith("AS") and candidate[2:].isdigit():
+        preferred = ["aut-num"]
+    elif "_" in candidate and ":" in candidate:
+        preferred = ["route6", "inet6num"]
+    elif "_" in candidate:
+        preferred = ["route", "inetnum"]
+    elif candidate.endswith("-MNT"):
+        preferred = ["mntner"]
+    else:
+        preferred = ["person", "role", "mntner", "domain", "dns"]
+
+    dirs = []
+    for name in preferred:
+        path = os.path.join(data_dir, name)
+        if os.path.isdir(path):
+            dirs.append(name)
+    for name in sorted(os.listdir(data_dir)):
+        path = os.path.join(data_dir, name)
+        if os.path.isdir(path) and name not in dirs:
+            dirs.append(name)
+    return dirs
+
+
 def _build_autnum_index(repo_path):
     index = {}
     autnum_dir = os.path.join(repo_path, "data", "aut-num")
@@ -319,6 +399,27 @@ def get_registry_emails_for_asn(asn):
                 for email in EMAIL_PATTERN.findall(value):
                     emails.add(email)
     return emails
+
+
+def get_registry_object_text(query):
+    if not ensure_registry_cache():
+        return None
+
+    repo_path = _repo_dir()
+    for candidate in _candidate_names(query):
+        for object_type in _candidate_object_dirs(candidate):
+            path = os.path.join(repo_path, "data", object_type, candidate)
+            if not os.path.isfile(path):
+                continue
+            text = _read_registry_text(path)
+            if not text:
+                continue
+            return (
+                "% This result is served from the local DN42 registry cache.\n\n"
+                f"% Information related to '{object_type}/{candidate}':\n"
+                f"{text}"
+            )
+    return None
 
 
 def get_last_sync_time():

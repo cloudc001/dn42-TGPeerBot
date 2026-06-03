@@ -18,6 +18,7 @@ get_info = tools.get_info
 get_map = get_map.get_map
 get_whoisinfo_by_asn = tools.get_whoisinfo_by_asn
 get_registry_emails_for_asn = registry_cache.get_registry_emails_for_asn
+get_registry_object_text = registry_cache.get_registry_object_text
 sync_registry_cache = registry_cache.sync_registry_cache
 servers_check = servers_check.servers_check
 split_long_msg = tools.split_long_msg

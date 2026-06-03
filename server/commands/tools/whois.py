@@ -23,6 +23,65 @@ def get_extra_route(asn):
         return f"% Routes for 'AS{asn}':\n{route_result.strip()}"
 
 
+def normalize_dn42_whois_query(query):
+    try:
+        asn = int(query)
+    except ValueError:
+        return query
+    if asn < 10000:
+        return f"AS424242{asn:04d}"
+    if 20000 <= asn < 30000:
+        return f"AS42424{asn}"
+    return f"AS{asn}"
+
+
+def append_asn_extra_result(whois_str, whois_result):
+    try:
+        asn = int(whois_str[2:])
+        if route_result := get_extra_route(asn):
+            whois_result += f"\n\n{route_result}"
+        if stats_result := get_stats(asn)[1]:
+            whois_result += (
+                "\n\n"
+                f"% Statistics for 'AS{asn}':\n"
+                f'centrality:         {stats_result["centrality"]}\n'
+                f'closeness:          {stats_result["closeness"]}\n'
+                f'betweenness:        {stats_result["betweenness"]}\n'
+                f'peer count:         {stats_result["peer"]}'
+            )
+    except BaseException:
+        pass
+    return whois_result
+
+
+def reply_whois_result(message, whois_result):
+    if len(whois_result) > 4000:
+        whois_result = tools.split_long_msg(whois_result)
+        last_msg = message
+        for index, m in enumerate(whois_result):
+            if index < len(whois_result) - 1:
+                last_msg = bot.reply_to(
+                    last_msg,
+                    f"```WhoisResult\n{m}```To be continued...",
+                    parse_mode="Markdown",
+                    reply_markup=tools.gen_peer_me_markup(message),
+                )
+            else:
+                bot.reply_to(
+                    last_msg,
+                    f"```WhoisResult\n{m}```",
+                    parse_mode="Markdown",
+                    reply_markup=tools.gen_peer_me_markup(message),
+                )
+    else:
+        bot.reply_to(
+            message,
+            f"```WhoisResult\n{whois_result}```",
+            parse_mode="Markdown",
+            reply_markup=tools.gen_peer_me_markup(message),
+        )
+
+
 @bot.message_handler(commands=["whois"])
 def whois(message):
     if len(message.text.split()) < 2:
@@ -50,6 +109,12 @@ def whois(message):
         )
         return
     bot.send_chat_action(chat_id=message.chat.id, action="typing")
+    local_whois_str = normalize_dn42_whois_query(whois_str)
+    local_whois_result = tools.get_registry_object_text(local_whois_str)
+    if local_whois_result:
+        local_whois_result = append_asn_extra_result(local_whois_str, local_whois_result)
+        reply_whois_result(message, local_whois_result)
+        return
     whois_command = f"whois -h {config.WHOIS_ADDRESS} {whois_str}"
     while True:
         try:
