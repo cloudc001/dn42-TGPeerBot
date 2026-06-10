@@ -85,6 +85,15 @@ def _local_parse_peer_text(text):
 
     if match := re.search(r"\bmtu\b[^0-9]{0,12}([0-9]{4})\b", text, re.IGNORECASE):
         parsed["mtu"] = int(match.group(1))
+    else:
+        for line in text.splitlines():
+            line = line.strip()
+            if not re.fullmatch(r"[0-9]{4}", line):
+                continue
+            value = int(line)
+            if 1280 <= value <= 1420:
+                parsed["mtu"] = value
+                break
 
     parsed["mp_bgp"] = _parse_bool_default_true(text, ("no mp-bgp", "no mpbgp", "disable mp-bgp", "关闭 mp-bgp", "关闭mpbgp"))
     parsed["extended_next_hop"] = _parse_bool_default_true(
@@ -107,7 +116,8 @@ def _deepseek_parse_peer_text(text):
         "You are a DN42 peer information parser. Extract target_node, asn, endpoint, public_key, "
         "peer_link_local, mtu, mp_bgp, extended_next_hop. Output JSON only. Use null for missing "
         "required fields. Do not invent ASN, endpoint, public_key, peer_link_local, or target_node. "
-        "Default mp_bgp and extended_next_hop to true unless the user explicitly disables them."
+        "Default mp_bgp and extended_next_hop to true unless the user explicitly disables them. "
+        "If a standalone line contains only a number between 1280 and 1420, treat it as mtu."
     )
     try:
         resp = requests.post(
