@@ -12,7 +12,7 @@ import time
 from ipaddress import IPv4Network, IPv6Network, ip_address
 
 
-AGENT_VERSION = 30
+AGENT_VERSION = 31
 WG_DIR = "/etc/wireguard"
 BIRD_PEER_DIR = "/etc/bird/dn42_peers"
 WG_PRIVATE_KEY_PATH = "/etc/wireguard/dn42-privatekey"
@@ -108,6 +108,13 @@ def pick_bird_neighbor_address(peer_info):
     return peer_info.get("IPv6") or peer_info.get("IPv4")
 
 
+def format_bird_description(asn, contact):
+    contact = str(contact or "").strip()
+    if contact:
+        return f"AS{asn} {contact}"
+    return f"AS{asn}"
+
+
 def ensure_autopeer_peer_info(payload, cfg):
     try:
         peer_info = json.loads(payload)
@@ -196,7 +203,7 @@ def build_autopeer_configs(peer_info, cfg):
     )
     bird = (
         f"protocol bgp {peer_info['protocol_name']} from dn42_ebgp_mp {{\n"
-        f'    description "DN42 Peer with {peer_info["Contact"]}";\n'
+        f'    description "DN42 Peer with {format_bird_description(peer_info["ASN"], peer_info["Contact"])}";\n'
         f"    neighbor {peer_info['IPv6']}%'{peer_info['interface_name']}' as {peer_info['ASN']};\n"
         f'    interface "{peer_info["interface_name"]}";\n'
         "};\n"
@@ -626,7 +633,7 @@ def act_peer(payload, cfg):
     description_text = str(peer_info.get("Contact", "")).strip() or f"dn42_{peer_info['ASN']}"
     bird = (
         f"protocol bgp {protocol_name} from dn42_ebgp_mp {{\n"
-        f'    description "DN42 Peer with {description_text}";\n'
+        f'    description "DN42 Peer with {format_bird_description(peer_info["ASN"], description_text)}";\n'
         f"    neighbor {neighbor}%'{interface_name}' as {peer_info['ASN']};\n"
         f'    interface "{interface_name}";\n'
         "};\n"

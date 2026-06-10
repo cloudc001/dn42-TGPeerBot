@@ -14,6 +14,13 @@ from telebot.types import ReplyKeyboardRemove
 
 PENDING = {}
 REQUIRED_FIELDS = ("target_node", "asn", "endpoint", "public_key", "peer_link_local")
+FIELD_PROMPTS = {
+    "target_node": "Which target node should be used? Example: HK\n目标节点是哪一个？例如：HK",
+    "asn": "What is the peer ASN? Example: 4242421260\n对端 ASN 是多少？例如：4242421260",
+    "endpoint": "What is the WireGuard endpoint? Example: 405218.xyz:60103\nWireGuard endpoint 是什么？例如：405218.xyz:60103",
+    "public_key": "What is the peer WireGuard public key?\n对端 WireGuard 公钥是什么？",
+    "peer_link_local": "What is the peer link-local address? Example: fe80::9527\n对端 link-local 地址是什么？例如：fe80::9527",
+}
 
 
 def _node_aliases():
@@ -76,7 +83,7 @@ def _local_parse_peer_text(text):
         peer_ll = match.group(0).split("%", 1)[0].split("/", 1)[0]
         parsed["peer_link_local"] = peer_ll
 
-    if match := re.search(r"\bmtu\b\s*[:=]?\s*([0-9]{4})\b", text, re.IGNORECASE):
+    if match := re.search(r"\bmtu\b[^0-9]{0,12}([0-9]{4})\b", text, re.IGNORECASE):
         parsed["mtu"] = int(match.group(1))
 
     parsed["mp_bgp"] = _parse_bool_default_true(text, ("no mp-bgp", "no mpbgp", "disable mp-bgp", "关闭 mp-bgp", "关闭mpbgp"))
@@ -135,10 +142,38 @@ def parse_peer_text(text):
     return parsed
 
 
+def missing_required_fields(parsed):
+    return [field for field in REQUIRED_FIELDS if parsed.get(field) in (None, "")]
+
+
+def extract_single_field(field, text):
+    parsed = _local_parse_peer_text(text)
+    if field in parsed and parsed[field] not in (None, ""):
+        return parsed[field]
+    if field == "target_node":
+        aliases = _node_aliases()
+        value = aliases.get(text.strip().upper())
+        if value:
+            return value
+    if field == "asn":
+        if match := re.search(r"\b(?:AS)?\s*(424242[0-9]{4})\b", text, re.IGNORECASE):
+            return int(match.group(1))
+    if field == "endpoint":
+        if match := re.search(r"(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+):([0-9]{1,5})", text):
+            return f"{match.group(1)}:{match.group(2)}"
+    if field == "public_key":
+        if match := re.search(r"\b[A-Za-z0-9+/]{43}=", text):
+            return match.group(0)
+    if field == "peer_link_local":
+        if match := re.search(r"\bfe80:[0-9A-Fa-f:]+(?:%[A-Za-z0-9_.-]+)?(?:/[0-9]{1,3})?\b", text, re.IGNORECASE):
+            return match.group(0).split("%", 1)[0].split("/", 1)[0]
+    return None
+
+
 def validate_parsed(parsed):
     errors = []
     normalized = dict(parsed)
-    missing = [field for field in REQUIRED_FIELDS if normalized.get(field) in (None, "")]
+    missing = missing_required_fields(normalized)
     if missing:
         errors.append("Missing required fields: " + ", ".join(missing))
 
@@ -320,7 +355,16 @@ def handle_autopeer_message(message):
 
 def handle_autopeer_text(message, text):
     bot.send_message(message.chat.id, "Parsing and dry-running AutoPeer...\n正在解析并执行 dry-run...", reply_markup=ReplyKeyboardRemove())
-    parsed, errors = validate_parsed(parse_peer_text(text))
+    continue_autopeer_with_parsed(message, parse_peer_text(text))
+
+
+def continue_autopeer_with_parsed(message, parsed):
+    missing = missing_required_fields(parsed)
+    if missing:
+        ask_missing_field(message, parsed, missing[0])
+        return
+
+    parsed, errors = validate_parsed(parsed)
     if errors:
         bot.send_message(
             message.chat.id,
@@ -366,6 +410,39 @@ def handle_autopeer_text(message, text):
     _send_long(message.chat.id, _format_dryrun(parsed, dryrun))
     msg = bot.send_message(message.chat.id, "Confirm deployment? Reply yes to continue.\n确认部署？回复 yes 继续。")
     bot.register_next_step_handler(msg, partial(confirm_autopeer, message.chat.id))
+
+
+def ask_missing_field(message, parsed, field):
+    msg = bot.send_message(
+        message.chat.id,
+        "AutoPeer needs one more required value.\n"
+        "AutoPeer 还需要补充一个必填值。\n\n"
+        f"{FIELD_PROMPTS[field]}\n\n"
+        "Use /cancel to abort.\n使用 /cancel 取消。",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    bot.register_next_step_handler(msg, partial(handle_missing_field, parsed, field))
+
+
+def handle_missing_field(parsed, field, message):
+    if message.text.strip() == "/cancel":
+        bot.send_message(message.chat.id, "Cancelled.\n已取消。", reply_markup=ReplyKeyboardRemove())
+        return
+
+    value = extract_single_field(field, message.text.strip())
+    if value in (None, ""):
+        msg = bot.send_message(
+            message.chat.id,
+            "I could not recognize that value. Please try again.\n"
+            "没有识别到这个值，请重新输入。\n\n"
+            f"{FIELD_PROMPTS[field]}",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        bot.register_next_step_handler(msg, partial(handle_missing_field, parsed, field))
+        return
+
+    parsed[field] = value
+    continue_autopeer_with_parsed(message, parsed)
 
 
 def confirm_autopeer(chat_id, message):
