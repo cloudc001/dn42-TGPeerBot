@@ -21,6 +21,7 @@ My bot is deployed at [@Cloudc001Bot](https://t.me/Cloudc001Bot). Welcome to pee
 - Checks registry freshness once per minute and reclones when the local cache is behind.
 - Adds a per-user request guard: if a previous command has not replied yet, later messages from the same user are ignored until completion or timeout.
 - Adds clearer whois failure handling during login.
+- Adds privileged `/autopeer` dry-run, deploy, and rollback workflow.
 
 ### Architecture
 
@@ -42,6 +43,7 @@ The SSH backend is recommended for small VPS nodes because it does not require a
 - User login by DN42 ASN and registry email verification.
 - Privileged login code for operator-controlled access.
 - Peer creation, modification, removal, restart, and status query.
+- Privileged AutoPeer workflow from free-form peer text.
 - Multi-node peer selection and node availability checks.
 - WireGuard and BIRD configuration generation.
 - DN42 tools: ping, tcping, traceroute, route lookup, AS path lookup, whois, dig, and NS lookup.
@@ -144,6 +146,36 @@ In production, expose the agent API only to the bot server and protect it with a
 | `DN42_REGISTRY_REPOS` | Registry clone sources, tried in order. |
 | `REQUEST_REPLY_TIMEOUT` | Per-message reply timeout in seconds. |
 | `PRIVILEGE_CODE` | Optional operator privilege code. |
+| `AUTOPEER_DEFAULT_MTU` | Default MTU used by `/autopeer` when not provided. |
+| `AUTOPEER_USE_DEEPSEEK` | Optional DeepSeek parsing switch. Local parser works without it. |
+| `DEEPSEEK_BASE_URL` | DeepSeek-compatible API base URL. |
+| `DEEPSEEK_MODEL` | DeepSeek model name for free-form parsing. |
+
+### AutoPeer
+
+`/autopeer` is a privileged Telegram command. It accepts free-form peer information, extracts a strict internal schema, performs node-side dry-run validation, and only deploys after explicit confirmation.
+
+Example:
+
+```text
+/autopeer add HK
+asn 4242421260
+405218.xyz:60103
+public key 9zsuhOiSC8rKsdUNtX678wh3rTo4McJ9ueDqm1Ha8wI=
+ll fe80::9527
+mtu 1420
+```
+
+Workflow:
+
+1. Parse target node, ASN, endpoint, WireGuard public key, peer link-local, MTU, MP-BGP, and extended next-hop.
+2. Validate required fields and value ranges.
+3. Call the target node's fixed `dn42-agentctl autopeer_dryrun` action.
+4. Show generated WireGuard and BIRD config, target paths, commands, and conflicts.
+5. Deploy only after the operator replies `yes`.
+6. Roll back the latest AutoPeer on a node with `/autopeer rollback <node>`.
+
+DeepSeek parsing is optional. If enabled, set `AUTOPEER_USE_DEEPSEEK = True` and provide `DEEPSEEK_API_KEY` through the environment. The model output is only used as parser input; deployment is still performed by deterministic schema validation and node-side fixed actions.
 
 ### DN42 registry cache
 
@@ -183,6 +215,7 @@ DN42-TGPeerBot 是一个面向 DN42 网络运营者的 Telegram 机器人。它�
 - 每分钟检查一次 registry 是否为最新版本；如果本地落后，则重新 clone。
 - 新增用户请求保护：同一用户上一条消息尚未产生回复时，不处理后续消息，直到完成或超时。
 - 登录时对 whois 故障给出更明确的错误提示。
+- 新增管理员 `/autopeer` dry-run、确认部署和回滚流程。
 
 ### 架构
 
@@ -204,6 +237,7 @@ Telegram Bot Server
 - 基于 DN42 ASN 和 registry 邮箱验证码登录。
 - 支持特权代码登录。
 - 创建、修改、删除、重启和查看 peer。
+- 管理员可通过自由文本 AutoPeer 创建 peer。
 - 支持多节点选择和节点可用性检查。
 - 生成 WireGuard 和 BIRD 配置。
 - DN42 工具：ping、tcping、traceroute、route lookup、AS path lookup、whois、dig、NS lookup。
@@ -306,6 +340,36 @@ python main.py
 | `DN42_REGISTRY_REPOS` | registry clone 来源，按顺序尝试。 |
 | `REQUEST_REPLY_TIMEOUT` | 单条消息回复超时时间，单位秒。 |
 | `PRIVILEGE_CODE` | 可选特权登录代码。 |
+| `AUTOPEER_DEFAULT_MTU` | `/autopeer` 未提供 MTU 时使用的默认值。 |
+| `AUTOPEER_USE_DEEPSEEK` | 可选 DeepSeek 解析开关；不开启时使用本地规则解析。 |
+| `DEEPSEEK_BASE_URL` | DeepSeek 兼容 API 地址。 |
+| `DEEPSEEK_MODEL` | 用于自由文本解析的 DeepSeek 模型名。 |
+
+### AutoPeer
+
+`/autopeer` 是管理员命令。它可以接收自由格式 peer 信息，提取严格结构，调用节点侧 dry-run 校验，并且只有管理员明确回复 `yes` 后才会部署。
+
+示例：
+
+```text
+/autopeer add HK
+asn 4242421260
+405218.xyz:60103
+public key 9zsuhOiSC8rKsdUNtX678wh3rTo4McJ9ueDqm1Ha8wI=
+ll fe80::9527
+mtu 1420
+```
+
+流程：
+
+1. 解析目标节点、ASN、endpoint、WireGuard 公钥、对端 link-local、MTU、MP-BGP 和 extended next-hop。
+2. 校验必填字段和值范围。
+3. 调用目标节点固定动作 `dn42-agentctl autopeer_dryrun`。
+4. 展示将生成的 WireGuard/BIRD 配置、目标路径、将执行的命令和冲突信息。
+5. 管理员回复 `yes` 后才执行部署。
+6. 使用 `/autopeer rollback <节点>` 回滚某节点最近一次 AutoPeer。
+
+DeepSeek 解析是可选项。开启时设置 `AUTOPEER_USE_DEEPSEEK = True`，并通过环境变量提供 `DEEPSEEK_API_KEY`。模型只负责解析输入，部署仍由严格 schema 校验和节点侧固定动作完成。
 
 ### DN42 registry 本地缓存
 

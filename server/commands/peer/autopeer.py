@@ -1,0 +1,409 @@
+import base64
+import json
+import os
+import re
+from functools import partial
+from ipaddress import IPv6Network, ip_address
+
+import config
+import requests
+import tools
+from base import bot, db_privilege
+from telebot.types import ReplyKeyboardRemove
+
+
+PENDING = {}
+REQUIRED_FIELDS = ("target_node", "asn", "endpoint", "public_key", "peer_link_local")
+
+
+def _node_aliases():
+    aliases = {}
+    for key, label in config.SERVERS.items():
+        aliases[str(key).upper()] = key
+        first = str(label).split("|", 1)[0].strip().upper()
+        if first:
+            aliases[first] = key
+    return aliases
+
+
+def _send_long(chat_id, text):
+    chunks = tools.split_long_msg(text, limit=3800) or [text[:3800]]
+    for chunk in chunks:
+        bot.send_message(chat_id, chunk, reply_markup=ReplyKeyboardRemove())
+
+
+def _parse_bool_default_true(text, negative_words):
+    lowered = text.lower()
+    return not any(word in lowered for word in negative_words)
+
+
+def _local_parse_peer_text(text):
+    aliases = _node_aliases()
+    parsed = {
+        "target_node": None,
+        "asn": None,
+        "endpoint": None,
+        "public_key": None,
+        "peer_link_local": None,
+        "mtu": None,
+        "mp_bgp": True,
+        "extended_next_hop": True,
+    }
+
+    words = re.findall(r"[A-Za-z0-9_-]+", text)
+    for word in words:
+        key = aliases.get(word.upper())
+        if key:
+            parsed["target_node"] = key
+            break
+
+    if match := re.search(r"\bAS?\s*(424242[0-9]{4})\b", text, re.IGNORECASE):
+        parsed["asn"] = int(match.group(1))
+    elif match := re.search(r"\b(424242[0-9]{4})\b", text):
+        parsed["asn"] = int(match.group(1))
+
+    endpoint_pattern = re.compile(r"(?<![A-Za-z0-9+/=])(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+):([0-9]{1,5})(?![A-Za-z0-9+/=])")
+    for host, port in endpoint_pattern.findall(text):
+        if host.lower().startswith("fe80"):
+            continue
+        parsed["endpoint"] = f"{host}:{port}"
+        break
+
+    if match := re.search(r"\b[A-Za-z0-9+/]{43}=", text):
+        parsed["public_key"] = match.group(0)
+
+    if match := re.search(r"\bfe80:[0-9A-Fa-f:]+(?:%[A-Za-z0-9_.-]+)?(?:/[0-9]{1,3})?\b", text, re.IGNORECASE):
+        peer_ll = match.group(0).split("%", 1)[0].split("/", 1)[0]
+        parsed["peer_link_local"] = peer_ll
+
+    if match := re.search(r"\bmtu\b\s*[:=]?\s*([0-9]{4})\b", text, re.IGNORECASE):
+        parsed["mtu"] = int(match.group(1))
+
+    parsed["mp_bgp"] = _parse_bool_default_true(text, ("no mp-bgp", "no mpbgp", "disable mp-bgp", "关闭 mp-bgp", "关闭mpbgp"))
+    parsed["extended_next_hop"] = _parse_bool_default_true(
+        text,
+        ("no extended nexthop", "no extended next-hop", "no enh", "disable enh", "关闭 extended", "关闭 enh"),
+    )
+    return parsed
+
+
+def _deepseek_parse_peer_text(text):
+    if not bool(getattr(config, "AUTOPEER_USE_DEEPSEEK", False)):
+        return None
+    api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    if not api_key:
+        return None
+
+    base_url = str(getattr(config, "DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")).rstrip("/")
+    model = str(getattr(config, "DEEPSEEK_MODEL", "deepseek-v4-flash"))
+    system_prompt = (
+        "You are a DN42 peer information parser. Extract target_node, asn, endpoint, public_key, "
+        "peer_link_local, mtu, mp_bgp, extended_next_hop. Output JSON only. Use null for missing "
+        "required fields. Do not invent ASN, endpoint, public_key, peer_link_local, or target_node. "
+        "Default mp_bgp and extended_next_hop to true unless the user explicitly disables them."
+    )
+    try:
+        resp = requests.post(
+            f"{base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={
+                "model": model,
+                "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": text}],
+                "temperature": 0,
+                "response_format": {"type": "json_object"},
+            },
+            timeout=20,
+        )
+        resp.raise_for_status()
+        content = resp.json()["choices"][0]["message"]["content"]
+        parsed = json.loads(content)
+    except BaseException:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def parse_peer_text(text):
+    parsed = _local_parse_peer_text(text)
+    ai_parsed = _deepseek_parse_peer_text(text)
+    if ai_parsed:
+        for key in ("target_node", "asn", "endpoint", "public_key", "peer_link_local", "mtu"):
+            if ai_parsed.get(key) not in (None, ""):
+                parsed[key] = ai_parsed[key]
+        for key in ("mp_bgp", "extended_next_hop"):
+            if isinstance(ai_parsed.get(key), bool):
+                parsed[key] = ai_parsed[key]
+    return parsed
+
+
+def validate_parsed(parsed):
+    errors = []
+    normalized = dict(parsed)
+    missing = [field for field in REQUIRED_FIELDS if normalized.get(field) in (None, "")]
+    if missing:
+        errors.append("Missing required fields: " + ", ".join(missing))
+
+    aliases = _node_aliases()
+    target = normalized.get("target_node")
+    if target:
+        target_key = aliases.get(str(target).upper(), target)
+        if target_key not in config.SERVERS:
+            errors.append(f"Unknown target node: {target}")
+        normalized["target_node"] = target_key
+
+    try:
+        asn = int(normalized.get("asn"))
+        if not (4242420000 <= asn <= 4242429999):
+            raise ValueError
+        normalized["asn"] = asn
+    except (TypeError, ValueError):
+        errors.append("ASN must be in AS424242xxxx range")
+
+    endpoint = normalized.get("endpoint")
+    if endpoint:
+        if not re.fullmatch(r"\[?[A-Za-z0-9:._-]+\]?:[0-9]{1,5}", str(endpoint)):
+            errors.append("Endpoint must be host:port")
+        else:
+            port = int(str(endpoint).rsplit(":", 1)[1])
+            if not (1 <= port <= 65535):
+                errors.append("Endpoint port must be between 1 and 65535")
+
+    public_key = normalized.get("public_key")
+    if public_key:
+        try:
+            raw_key = base64.b64decode(public_key, validate=True)
+            if len(raw_key) != 32:
+                raise ValueError
+        except BaseException:
+            errors.append("WireGuard public key must be a valid 32-byte base64 key")
+
+    peer_ll = normalized.get("peer_link_local")
+    if peer_ll:
+        try:
+            if ip_address(peer_ll) not in IPv6Network("fe80::/10"):
+                raise ValueError
+        except ValueError:
+            errors.append("Peer link-local must be an IPv6 address in fe80::/10")
+
+    mtu = normalized.get("mtu")
+    if mtu in (None, ""):
+        normalized["mtu"] = int(getattr(config, "AUTOPEER_DEFAULT_MTU", 1420))
+    else:
+        try:
+            mtu = int(mtu)
+            if not (1280 <= mtu <= 1420):
+                raise ValueError
+            normalized["mtu"] = mtu
+        except (TypeError, ValueError):
+            errors.append("MTU must be between 1280 and 1420")
+
+    normalized["mp_bgp"] = bool(normalized.get("mp_bgp", True))
+    normalized["extended_next_hop"] = bool(normalized.get("extended_next_hop", True))
+    return normalized, errors
+
+
+def _contact_for(message, asn):
+    if message.from_user and message.from_user.username:
+        return "@" + message.from_user.username
+    return tools.get_whoisinfo_by_asn(asn)
+
+
+def build_peer_payload(parsed, local_link_local, contact):
+    asn = parsed["asn"]
+    return {
+        "ASN": asn,
+        "Channel": "IPv6 & IPv4",
+        "MP-BGP": "IPv6" if parsed["mp_bgp"] else "Not supported",
+        "ENH": parsed["extended_next_hop"],
+        "IPv6": parsed["peer_link_local"],
+        "IPv4": "Not required due to Extended Next Hop",
+        "Request-LinkLocal": local_link_local,
+        "Clearnet": parsed["endpoint"],
+        "PublicKey": parsed["public_key"],
+        "Port": "2" + str(asn)[-4:],
+        "MTU": parsed["mtu"],
+        "Contact": contact,
+    }
+
+
+def _format_dryrun(parsed, dryrun):
+    peer_json = json.dumps(
+        {
+            "target_node": parsed["target_node"],
+            "asn": parsed["asn"],
+            "endpoint": parsed["endpoint"],
+            "public_key": parsed["public_key"],
+            "peer_link_local": parsed["peer_link_local"],
+            "mtu": parsed["mtu"],
+            "mp_bgp": parsed["mp_bgp"],
+            "extended_next_hop": parsed["extended_next_hop"],
+        },
+        indent=2,
+        ensure_ascii=False,
+    )
+    conflicts = "\n".join(f"- {item}" for item in dryrun.get("conflicts", [])) or "- none"
+    commands = "\n".join(f"- {item}" for item in dryrun.get("commands", []))
+    return (
+        "AutoPeer dry-run\n"
+        f"Target node: {parsed['target_node']} ({config.SERVERS[parsed['target_node']]})\n"
+        f"ASN: AS{parsed['asn']}\n"
+        f"WG file: {dryrun['wg_path']}\n"
+        f"BIRD file: {dryrun['bird_path']}\n"
+        "\nParsed JSON:\n"
+        f"{peer_json}\n"
+        "\nWireGuard config:\n"
+        f"{dryrun['wg_config']}\n"
+        "\nBIRD config:\n"
+        f"{dryrun['bird_config']}\n"
+        "\nCommands:\n"
+        f"{commands}\n"
+        "\nConflicts:\n"
+        f"{conflicts}\n"
+        "\nReply yes to deploy, or /cancel to abort."
+    )
+
+
+def _format_deploy_result(result):
+    verify = result.get("verify", {})
+    bird = verify.get("bird_protocol", "")
+    bgp_state = "Established" if "Established" in bird else "not established"
+    handshake = verify.get("wg_handshake", "").strip()
+    has_handshake = bool(handshake and not handshake.endswith("\t0") and "Unable to access interface" not in handshake)
+    return (
+        "AutoPeer deployment finished.\n"
+        f"ASN: AS{result.get('peer', {}).get('ASN')}\n"
+        f"WG service: {verify.get('wg_service', 'unknown')}\n"
+        f"Handshake: {'seen' if has_handshake else 'not seen yet'}\n"
+        f"BGP: {bgp_state}\n"
+        "\nIf BGP is not established yet, common causes are: peer side not configured, endpoint/port/firewall issue, "
+        "wrong link-local address, or peer BIRD not running."
+    )
+
+
+@bot.message_handler(commands=["autopeer"], is_private_chat=True)
+def start_autopeer(message):
+    if message.chat.id not in db_privilege:
+        bot.send_message(
+            message.chat.id,
+            f"/autopeer is restricted. Please contact {config.CONTACT}.\n/autopeer 仅限管理员使用，请联系 {config.CONTACT}。",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+
+    parts = message.text.split(maxsplit=2)
+    if len(parts) >= 2 and parts[1].lower() == "rollback":
+        node = parts[2].strip() if len(parts) >= 3 else ""
+        rollback_autopeer(message, node)
+        return
+
+    text = message.text.partition(" ")[2].strip()
+    if text:
+        handle_autopeer_text(message, text)
+        return
+
+    msg = bot.send_message(
+        message.chat.id,
+        (
+            "Paste the DN42 peer information. Required: target node, ASN, endpoint, WireGuard public key, peer link-local.\n"
+            "请粘贴 DN42 peer 信息。必需字段：目标节点、ASN、endpoint、WireGuard 公钥、对端 link-local。"
+        ),
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    bot.register_next_step_handler(msg, handle_autopeer_message)
+
+
+def handle_autopeer_message(message):
+    if message.text.strip() == "/cancel":
+        bot.send_message(message.chat.id, "Cancelled.\n已取消。", reply_markup=ReplyKeyboardRemove())
+        return
+    handle_autopeer_text(message, message.text)
+
+
+def handle_autopeer_text(message, text):
+    bot.send_message(message.chat.id, "Parsing and dry-running AutoPeer...\n正在解析并执行 dry-run...", reply_markup=ReplyKeyboardRemove())
+    parsed, errors = validate_parsed(parse_peer_text(text))
+    if errors:
+        bot.send_message(
+            message.chat.id,
+            "AutoPeer input is incomplete or invalid:\n"
+            + "\n".join(f"- {item}" for item in errors)
+            + "\n\nUse /autopeer again with complete peer information.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+
+    pre = tools.call_agent_action("pre_peer", "", parsed["target_node"], timeout=12)
+    if pre.status != 200:
+        bot.send_message(message.chat.id, f"Target node is unavailable: {parsed['target_node']}", reply_markup=ReplyKeyboardRemove())
+        return
+    try:
+        local_link_local = json.loads(pre.text)["lla"]
+    except BaseException:
+        local_link_local = "fe80::3777"
+
+    payload = build_peer_payload(parsed, local_link_local, _contact_for(message, parsed["asn"]))
+    dry = tools.call_agent_action("autopeer_dryrun", payload, parsed["target_node"], timeout=20)
+    if dry.status == 400:
+        bot.send_message(message.chat.id, f"Dry-run validation failed:\n{dry.text}", reply_markup=ReplyKeyboardRemove())
+        return
+    if dry.status not in (200, 409):
+        bot.send_message(
+            message.chat.id,
+            f"Dry-run failed on node {parsed['target_node']} with status {dry.status}:\n{dry.text}",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+    try:
+        dryrun = json.loads(dry.text)
+    except BaseException:
+        bot.send_message(message.chat.id, "Dry-run returned invalid JSON.", reply_markup=ReplyKeyboardRemove())
+        return
+
+    if dryrun.get("conflicts"):
+        _send_long(message.chat.id, _format_dryrun(parsed, dryrun) + "\n\nDeployment is blocked until conflicts are resolved.")
+        return
+
+    PENDING[message.chat.id] = {"parsed": parsed, "payload": payload}
+    _send_long(message.chat.id, _format_dryrun(parsed, dryrun))
+    msg = bot.send_message(message.chat.id, "Confirm deployment? Reply yes to continue.\n确认部署？回复 yes 继续。")
+    bot.register_next_step_handler(msg, partial(confirm_autopeer, message.chat.id))
+
+
+def confirm_autopeer(chat_id, message):
+    pending = PENDING.pop(chat_id, None)
+    if not pending:
+        bot.send_message(message.chat.id, "No pending AutoPeer task.\n没有待确认的 AutoPeer 任务。", reply_markup=ReplyKeyboardRemove())
+        return
+    if message.text.strip().lower() != "yes":
+        bot.send_message(message.chat.id, "Cancelled.\n已取消。", reply_markup=ReplyKeyboardRemove())
+        return
+
+    parsed = pending["parsed"]
+    bot.send_message(message.chat.id, f"Deploying AutoPeer on {parsed['target_node']}...\n正在部署 AutoPeer...")
+    result = tools.call_agent_action("autopeer_deploy", pending["payload"], parsed["target_node"], timeout=60)
+    if result.status != 200:
+        bot.send_message(
+            message.chat.id,
+            f"Deployment failed with status {result.status}:\n{result.text}",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+    try:
+        body = json.loads(result.text)
+    except BaseException:
+        bot.send_message(message.chat.id, "Deployment finished but returned invalid JSON.", reply_markup=ReplyKeyboardRemove())
+        return
+    bot.send_message(message.chat.id, _format_deploy_result(body), reply_markup=ReplyKeyboardRemove())
+
+
+def rollback_autopeer(message, node):
+    aliases = _node_aliases()
+    node_key = aliases.get(str(node).upper(), node)
+    if not node_key or node_key not in config.SERVERS:
+        bot.send_message(message.chat.id, "Usage: /autopeer rollback <node>\n用法：/autopeer rollback <节点>", reply_markup=ReplyKeyboardRemove())
+        return
+    bot.send_message(message.chat.id, f"Rolling back last AutoPeer on {node_key}...\n正在回滚 {node_key} 最近一次 AutoPeer...")
+    result = tools.call_agent_action("autopeer_rollback", "", node_key, timeout=40)
+    if result.status != 200:
+        bot.send_message(message.chat.id, f"Rollback failed with status {result.status}:\n{result.text}", reply_markup=ReplyKeyboardRemove())
+        return
+    bot.send_message(message.chat.id, f"Rollback finished:\n{result.text}", reply_markup=ReplyKeyboardRemove())

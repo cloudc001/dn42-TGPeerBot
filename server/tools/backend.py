@@ -11,7 +11,22 @@ from requests_futures.sessions import FuturesSession
 
 
 api_result = namedtuple("api_result", ["text", "status"])
-SUPPORTED_ACTIONS = {"version", "pre_peer", "peer", "info", "remove", "restart", "ping", "trace", "tcping", "route", "path"}
+SUPPORTED_ACTIONS = {
+    "version",
+    "pre_peer",
+    "peer",
+    "info",
+    "remove",
+    "restart",
+    "autopeer_dryrun",
+    "autopeer_deploy",
+    "autopeer_rollback",
+    "ping",
+    "trace",
+    "tcping",
+    "route",
+    "path",
+}
 
 
 def backend_name():
