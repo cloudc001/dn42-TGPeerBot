@@ -13,6 +13,7 @@ from telebot.types import ReplyKeyboardRemove
 
 
 PENDING = {}
+PENDING_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "autopeer_pending.json")
 REQUIRED_FIELDS = ("target_node", "asn", "endpoint", "public_key", "peer_link_local")
 FIELD_PROMPTS = {
     "target_node": "Which target node should be used? Example: HK\n目标节点是哪一个？例如：HK",
@@ -37,6 +38,35 @@ def _send_long(chat_id, text):
     chunks = tools.split_long_msg(text, limit=3800) or [text[:3800]]
     for chunk in chunks:
         bot.send_message(chat_id, chunk, reply_markup=ReplyKeyboardRemove())
+
+
+def _load_pending():
+    global PENDING
+    try:
+        with open(PENDING_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        PENDING = {int(key): value for key, value in raw.items()}
+    except BaseException:
+        PENDING = {}
+
+
+def _save_pending():
+    try:
+        with open(PENDING_FILE, "w", encoding="utf-8") as f:
+            json.dump(PENDING, f, ensure_ascii=False, indent=2)
+    except BaseException:
+        pass
+
+
+def _set_pending(chat_id, value):
+    PENDING[int(chat_id)] = value
+    _save_pending()
+
+
+def _pop_pending(chat_id):
+    value = PENDING.pop(int(chat_id), None)
+    _save_pending()
+    return value
 
 
 def _parse_bool_default_true(text, negative_words):
@@ -498,7 +528,7 @@ def continue_autopeer_with_parsed(message, parsed):
         _send_long(message.chat.id, _format_dryrun(parsed, dryrun) + "\n\nDeployment is blocked until conflicts are resolved.")
         return
 
-    PENDING[message.chat.id] = {"parsed": parsed, "payload": payload}
+    _set_pending(message.chat.id, {"parsed": parsed, "payload": payload})
     _send_long(message.chat.id, _format_dryrun(parsed, dryrun))
     msg = bot.send_message(message.chat.id, "Confirm deployment? Reply yes to continue.\n确认部署？回复 yes 继续。")
     bot.register_next_step_handler(msg, partial(confirm_autopeer, message.chat.id))
@@ -538,19 +568,19 @@ def handle_missing_field(parsed, field, message):
 
 
 def confirm_autopeer(chat_id, message):
-    pending = PENDING.get(chat_id)
+    pending = PENDING.get(int(chat_id))
     if not pending:
         bot.send_message(message.chat.id, "No pending AutoPeer task.\n没有待确认的 AutoPeer 任务。", reply_markup=ReplyKeyboardRemove())
         return
     if message.text.strip() == "/cancel":
-        PENDING.pop(chat_id, None)
+        _pop_pending(chat_id)
         bot.send_message(message.chat.id, "Cancelled.\n已取消。", reply_markup=ReplyKeyboardRemove())
         return
 
     if message.text.strip().lower() != "yes":
         updates = parse_pending_update(message.text)
         if updates.get("_cancel"):
-            PENDING.pop(chat_id, None)
+            _pop_pending(chat_id)
             bot.send_message(message.chat.id, "Cancelled.\n已取消。", reply_markup=ReplyKeyboardRemove())
             return
         if not updates:
@@ -565,12 +595,12 @@ def confirm_autopeer(chat_id, message):
 
         parsed = dict(pending["parsed"])
         parsed.update({key: value for key, value in updates.items() if not key.startswith("_")})
-        PENDING.pop(chat_id, None)
+        _pop_pending(chat_id)
         bot.send_message(message.chat.id, "Correction received. Re-running dry-run...\n已收到修正，正在重新 dry-run。")
         continue_autopeer_with_parsed(message, parsed)
         return
 
-    PENDING.pop(chat_id, None)
+    _pop_pending(chat_id)
     parsed = pending["parsed"]
     bot.send_message(message.chat.id, f"Deploying AutoPeer on {parsed['target_node']}...\n正在部署 AutoPeer...")
     result = tools.call_agent_action("autopeer_deploy", pending["payload"], parsed["target_node"], timeout=60)
@@ -589,6 +619,11 @@ def confirm_autopeer(chat_id, message):
     bot.send_message(message.chat.id, _format_deploy_result(body), reply_markup=ReplyKeyboardRemove())
 
 
+@bot.message_handler(func=lambda message: message.chat.id in PENDING, is_private_chat=True)
+def continue_pending_autopeer(message):
+    confirm_autopeer(message.chat.id, message)
+
+
 def rollback_autopeer(message, node):
     aliases = _node_aliases()
     node_key = aliases.get(str(node).upper(), node)
@@ -601,3 +636,6 @@ def rollback_autopeer(message, node):
         bot.send_message(message.chat.id, f"Rollback failed with status {result.status}:\n{result.text}", reply_markup=ReplyKeyboardRemove())
         return
     bot.send_message(message.chat.id, f"Rollback finished:\n{result.text}", reply_markup=ReplyKeyboardRemove())
+
+
+_load_pending()

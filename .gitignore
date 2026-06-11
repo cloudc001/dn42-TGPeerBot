@@ -8,6 +8,7 @@ id_*
 
 # Runtime state
 server/*.pkl
+server/autopeer_pending.json
 server/dn42-registry/
 *.log
 
