@@ -108,7 +108,7 @@ def _local_parse_peer_text(text):
 
 
 def _deepseek_parse_peer_text(text):
-    if not bool(getattr(config, "AUTOPEER_USE_DEEPSEEK", False)):
+    if not bool(getattr(config, "AUTOPEER_USE_DEEPSEEK", True)):
         return None
     api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
     if not api_key:
@@ -117,13 +117,17 @@ def _deepseek_parse_peer_text(text):
     base_url = str(getattr(config, "DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")).rstrip("/")
     model = str(getattr(config, "DEEPSEEK_MODEL", "deepseek-v4-flash"))
     system_prompt = (
-        "You are a DN42 peer information parser. Extract target_node, asn, endpoint, public_key, "
-        "peer_link_local, mtu, listen_port, mp_bgp, extended_next_hop. Output JSON only. Use null for missing "
-        "required fields. Do not invent ASN, endpoint, public_key, peer_link_local, or target_node. "
-        "Default mp_bgp and extended_next_hop to true unless the user explicitly disables them. "
-        "If a standalone line contains only a number between 1280 and 1420, treat it as mtu. "
-        "Treat listenport, listen_port, listen-port, listenpor, local port, or explicit local/listen port values as listen_port. "
-        "Do not infer listen_port from endpoint unless the user explicitly says it is the local/listen port."
+        "You are a DN42 peer information parser. Output JSON only, with exactly these keys: "
+        "target_node, asn, endpoint, public_key, peer_link_local, mtu, listen_port, mp_bgp, extended_next_hop. "
+        "Use null for missing values. Do not invent target_node, asn, endpoint, public_key, or peer_link_local. "
+        "target_node is a configured node code such as HK, JP, SG, TH, US, UK, DE, CN. "
+        "asn must be a number like 4242421234. endpoint is the peer WireGuard remote endpoint in host:port form. "
+        "public_key is the 44-character WireGuard public key ending with '='. "
+        "peer_link_local is the peer fe80::/10 address. "
+        "mtu is the tunnel MTU; if a standalone line contains only a number between 1280 and 1420, treat it as mtu. "
+        "listen_port is the local WireGuard ListenPort; only set it when the user explicitly says listenport, listen_port, "
+        "listen-port, listenpor, local port, local listen port, or equivalent. Do not infer listen_port from endpoint. "
+        "Default mp_bgp and extended_next_hop to true unless the user explicitly disables them."
     )
     try:
         resp = requests.post(
@@ -145,16 +149,50 @@ def _deepseek_parse_peer_text(text):
     return parsed if isinstance(parsed, dict) else None
 
 
+def _normalize_ai_parsed(raw):
+    if not isinstance(raw, dict):
+        return {}
+    aliases = {
+        "target_node": ("target_node", "targetNode", "node", "region", "target"),
+        "asn": ("asn", "ASN", "as"),
+        "endpoint": ("endpoint", "wireguard_endpoint", "wg_endpoint", "remote_endpoint"),
+        "public_key": ("public_key", "publicKey", "pubkey", "wg_public_key", "wireguard_public_key"),
+        "peer_link_local": ("peer_link_local", "peerLinkLocal", "link_local", "linkLocal", "ll", "peer_ll"),
+        "mtu": ("mtu", "MTU"),
+        "listen_port": ("listen_port", "listenPort", "local_port", "localPort", "local_listen_port", "port"),
+        "mp_bgp": ("mp_bgp", "mpBgp", "mpbgp", "mp-bgp"),
+        "extended_next_hop": ("extended_next_hop", "extendedNextHop", "enh", "extended-nexthop", "extended_next-hop"),
+    }
+    normalized = {}
+    for key, candidates in aliases.items():
+        for candidate in candidates:
+            if raw.get(candidate) not in (None, ""):
+                normalized[key] = raw[candidate]
+                break
+    return normalized
+
+
 def parse_peer_text(text):
-    parsed = _local_parse_peer_text(text)
-    ai_parsed = _deepseek_parse_peer_text(text)
-    if ai_parsed:
-        for key in ("target_node", "asn", "endpoint", "public_key", "peer_link_local", "mtu", "listen_port"):
-            if ai_parsed.get(key) not in (None, ""):
-                parsed[key] = ai_parsed[key]
-        for key in ("mp_bgp", "extended_next_hop"):
-            if isinstance(ai_parsed.get(key), bool):
-                parsed[key] = ai_parsed[key]
+    local_parsed = _local_parse_peer_text(text)
+    ai_parsed = _normalize_ai_parsed(_deepseek_parse_peer_text(text))
+    if not ai_parsed:
+        return local_parsed
+
+    parsed = {
+        "target_node": None,
+        "asn": None,
+        "endpoint": None,
+        "public_key": None,
+        "peer_link_local": None,
+        "mtu": None,
+        "listen_port": None,
+        "mp_bgp": True,
+        "extended_next_hop": True,
+    }
+    for key in ("target_node", "asn", "endpoint", "public_key", "peer_link_local", "mtu", "listen_port"):
+        parsed[key] = ai_parsed.get(key) if ai_parsed.get(key) not in (None, "") else local_parsed.get(key)
+    for key in ("mp_bgp", "extended_next_hop"):
+        parsed[key] = ai_parsed[key] if isinstance(ai_parsed.get(key), bool) else local_parsed.get(key, True)
     return parsed
 
 

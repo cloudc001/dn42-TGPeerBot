@@ -147,7 +147,7 @@ In production, expose the agent API only to the bot server and protect it with a
 | `REQUEST_REPLY_TIMEOUT` | Per-message reply timeout in seconds. |
 | `PRIVILEGE_CODE` | Optional operator privilege code. |
 | `AUTOPEER_DEFAULT_MTU` | Default MTU used by `/autopeer` when not provided. |
-| `AUTOPEER_USE_DEEPSEEK` | Optional DeepSeek parsing switch. Local parser works without it. |
+| `AUTOPEER_USE_DEEPSEEK` | DeepSeek-first parsing switch. Local parser is fallback/supplement. |
 | `DEEPSEEK_BASE_URL` | DeepSeek-compatible API base URL. |
 | `DEEPSEEK_MODEL` | DeepSeek model name for free-form parsing. |
 
@@ -175,7 +175,7 @@ Workflow:
 5. Deploy only after the operator replies `yes`.
 6. Roll back the latest AutoPeer on a node with `/autopeer rollback <node>`.
 
-DeepSeek parsing is optional. If enabled, set `AUTOPEER_USE_DEEPSEEK = True` and provide `DEEPSEEK_API_KEY` through the environment. The model output is only used as parser input; deployment is still performed by deterministic schema validation and node-side fixed actions.
+When `AUTOPEER_USE_DEEPSEEK = True` and `DEEPSEEK_API_KEY` is available in the environment, `/autopeer` sends free-form peer text to DeepSeek first. The local parser is used only when DeepSeek is unavailable or when DeepSeek leaves fields empty. The model output is never executed directly; deployment is still performed by deterministic schema validation and node-side fixed actions.
 
 ### DN42 registry cache
 
@@ -341,7 +341,7 @@ python main.py
 | `REQUEST_REPLY_TIMEOUT` | 单条消息回复超时时间，单位秒。 |
 | `PRIVILEGE_CODE` | 可选特权登录代码。 |
 | `AUTOPEER_DEFAULT_MTU` | `/autopeer` 未提供 MTU 时使用的默认值。 |
-| `AUTOPEER_USE_DEEPSEEK` | 可选 DeepSeek 解析开关；不开启时使用本地规则解析。 |
+| `AUTOPEER_USE_DEEPSEEK` | DeepSeek 优先解析开关；本地解析只做 fallback/补漏。 |
 | `DEEPSEEK_BASE_URL` | DeepSeek 兼容 API 地址。 |
 | `DEEPSEEK_MODEL` | 用于自由文本解析的 DeepSeek 模型名。 |
 
@@ -369,7 +369,7 @@ mtu 1420
 5. 管理员回复 `yes` 后才执行部署。
 6. 使用 `/autopeer rollback <节点>` 回滚某节点最近一次 AutoPeer。
 
-DeepSeek 解析是可选项。开启时设置 `AUTOPEER_USE_DEEPSEEK = True`，并通过环境变量提供 `DEEPSEEK_API_KEY`。模型只负责解析输入，部署仍由严格 schema 校验和节点侧固定动作完成。
+当 `AUTOPEER_USE_DEEPSEEK = True` 且环境变量中存在 `DEEPSEEK_API_KEY` 时，`/autopeer` 会先把自由格式 peer 文本交给 DeepSeek 解析。本地解析只在 DeepSeek 不可用或字段为空时做 fallback/补漏。模型输出不会被直接执行，部署仍由严格 schema 校验和节点侧固定动作完成。
 
 ### DN42 registry 本地缓存
 

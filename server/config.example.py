@@ -95,12 +95,12 @@ CN_WHITELIST_IP = ["8.8.8.8", "2001:4860:4860::8888"]
 SENTRY_DSN = None
 
 # AutoPeer settings.
-# /autopeer is restricted to privileged users. The built-in local parser works
-# without any external API. DeepSeek is optional and is only used for parsing
-# free-form text when AUTOPEER_USE_DEEPSEEK is True and DEEPSEEK_API_KEY is set
-# in the environment.
+# /autopeer is restricted to privileged users by default. When DEEPSEEK_API_KEY
+# is set and AUTOPEER_USE_DEEPSEEK is True, free-form input is sent to DeepSeek
+# first. The local parser is then used only as fallback/supplement, and the
+# final result is still strictly validated before dry-run/deploy.
 AUTOPEER_DEFAULT_MTU = 1420
-AUTOPEER_USE_DEEPSEEK = False
+AUTOPEER_USE_DEEPSEEK = True
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
 DEEPSEEK_MODEL = "deepseek-v4-flash"
 
