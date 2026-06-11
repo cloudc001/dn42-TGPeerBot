@@ -53,6 +53,7 @@ def _local_parse_peer_text(text):
         "public_key": None,
         "peer_link_local": None,
         "mtu": None,
+        "listen_port": None,
         "mp_bgp": True,
         "extended_next_hop": True,
     }
@@ -69,7 +70,7 @@ def _local_parse_peer_text(text):
     elif match := re.search(r"\b(424242[0-9]{4})\b", text):
         parsed["asn"] = int(match.group(1))
 
-    endpoint_pattern = re.compile(r"(?<![A-Za-z0-9+/=])(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+):([0-9]{1,5})(?![A-Za-z0-9+/=])")
+    endpoint_pattern = re.compile(r"(?<![A-Za-z0-9+/=:.])(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+):([0-9]{1,5})(?![A-Za-z0-9+/=:.])")
     for host, port in endpoint_pattern.findall(text):
         if host.lower().startswith("fe80"):
             continue
@@ -95,6 +96,9 @@ def _local_parse_peer_text(text):
                 parsed["mtu"] = value
                 break
 
+    if match := re.search(r"\b(?:listen\s*port|listen[_-]?port|listenpor|local\s*port|port)\b[^0-9]{0,12}([0-9]{1,5})\b", text, re.IGNORECASE):
+        parsed["listen_port"] = int(match.group(1))
+
     parsed["mp_bgp"] = _parse_bool_default_true(text, ("no mp-bgp", "no mpbgp", "disable mp-bgp", "关闭 mp-bgp", "关闭mpbgp"))
     parsed["extended_next_hop"] = _parse_bool_default_true(
         text,
@@ -114,10 +118,12 @@ def _deepseek_parse_peer_text(text):
     model = str(getattr(config, "DEEPSEEK_MODEL", "deepseek-v4-flash"))
     system_prompt = (
         "You are a DN42 peer information parser. Extract target_node, asn, endpoint, public_key, "
-        "peer_link_local, mtu, mp_bgp, extended_next_hop. Output JSON only. Use null for missing "
+        "peer_link_local, mtu, listen_port, mp_bgp, extended_next_hop. Output JSON only. Use null for missing "
         "required fields. Do not invent ASN, endpoint, public_key, peer_link_local, or target_node. "
         "Default mp_bgp and extended_next_hop to true unless the user explicitly disables them. "
-        "If a standalone line contains only a number between 1280 and 1420, treat it as mtu."
+        "If a standalone line contains only a number between 1280 and 1420, treat it as mtu. "
+        "Treat listenport, listen_port, listen-port, listenpor, local port, or explicit local/listen port values as listen_port. "
+        "Do not infer listen_port from endpoint unless the user explicitly says it is the local/listen port."
     )
     try:
         resp = requests.post(
@@ -143,7 +149,7 @@ def parse_peer_text(text):
     parsed = _local_parse_peer_text(text)
     ai_parsed = _deepseek_parse_peer_text(text)
     if ai_parsed:
-        for key in ("target_node", "asn", "endpoint", "public_key", "peer_link_local", "mtu"):
+        for key in ("target_node", "asn", "endpoint", "public_key", "peer_link_local", "mtu", "listen_port"):
             if ai_parsed.get(key) not in (None, ""):
                 parsed[key] = ai_parsed[key]
         for key in ("mp_bgp", "extended_next_hop"):
@@ -169,7 +175,7 @@ def extract_single_field(field, text):
         if match := re.search(r"\b(?:AS)?\s*(424242[0-9]{4})\b", text, re.IGNORECASE):
             return int(match.group(1))
     if field == "endpoint":
-        if match := re.search(r"(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+):([0-9]{1,5})", text):
+        if match := re.search(r"(?<![A-Za-z0-9+/=:.])(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+):([0-9]{1,5})(?![A-Za-z0-9+/=:.])", text):
             return f"{match.group(1)}:{match.group(2)}"
     if field == "public_key":
         if match := re.search(r"\b[A-Za-z0-9+/]{43}=", text):
@@ -243,6 +249,15 @@ def validate_parsed(parsed):
 
     normalized["mp_bgp"] = bool(normalized.get("mp_bgp", True))
     normalized["extended_next_hop"] = bool(normalized.get("extended_next_hop", True))
+    listen_port = normalized.get("listen_port")
+    if listen_port not in (None, ""):
+        try:
+            listen_port = int(listen_port)
+            if not (1 <= listen_port <= 65535):
+                raise ValueError
+            normalized["listen_port"] = listen_port
+        except (TypeError, ValueError):
+            errors.append("Listen port must be between 1 and 65535")
     return normalized, errors
 
 
@@ -264,7 +279,7 @@ def build_peer_payload(parsed, local_link_local, contact):
         "Request-LinkLocal": local_link_local,
         "Clearnet": parsed["endpoint"],
         "PublicKey": parsed["public_key"],
-        "Port": "2" + str(asn)[-4:],
+        "Port": str(parsed.get("listen_port") or ("2" + str(asn)[-4:])),
         "MTU": parsed["mtu"],
         "Contact": contact,
     }
@@ -279,6 +294,7 @@ def _format_dryrun(parsed, dryrun):
             "public_key": parsed["public_key"],
             "peer_link_local": parsed["peer_link_local"],
             "mtu": parsed["mtu"],
+            "listen_port": parsed.get("listen_port") or ("2" + str(parsed["asn"])[-4:]),
             "mp_bgp": parsed["mp_bgp"],
             "extended_next_hop": parsed["extended_next_hop"],
         },
@@ -291,6 +307,7 @@ def _format_dryrun(parsed, dryrun):
         "AutoPeer dry-run\n"
         f"Target node: {parsed['target_node']} ({config.SERVERS[parsed['target_node']]})\n"
         f"ASN: AS{parsed['asn']}\n"
+        f"Listen port: {parsed.get('listen_port') or ('2' + str(parsed['asn'])[-4:])}\n"
         f"WG file: {dryrun['wg_path']}\n"
         f"BIRD file: {dryrun['bird_path']}\n"
         "\nParsed JSON:\n"
@@ -303,7 +320,7 @@ def _format_dryrun(parsed, dryrun):
         f"{commands}\n"
         "\nConflicts:\n"
         f"{conflicts}\n"
-        "\nReply yes to deploy, or /cancel to abort."
+        "\nReply yes to deploy, send corrections like listenport=36708, mtu=1380, endpoint=host:port, or /cancel to abort."
     )
 
 
@@ -322,6 +339,33 @@ def _format_deploy_result(result):
         "\nIf BGP is not established yet, common causes are: peer side not configured, endpoint/port/firewall issue, "
         "wrong link-local address, or peer BIRD not running."
     )
+
+
+def parse_pending_update(text):
+    text = text.strip()
+    updates = {}
+
+    if match := re.search(r"\b(?:listen\s*port|listen[_-]?port|listenpor|local\s*port|port)\b[^0-9]{0,12}([0-9]{1,5})\b", text, re.IGNORECASE):
+        updates["listen_port"] = int(match.group(1))
+    if match := re.search(r"\bmtu\b[^0-9]{0,12}([0-9]{4})\b", text, re.IGNORECASE):
+        updates["mtu"] = int(match.group(1))
+    if match := re.search(r"\b(?:endpoint|end\s*point|remote)\b[^A-Za-z0-9[]*?(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+):([0-9]{1,5})(?![A-Za-z0-9+/=:.])", text, re.IGNORECASE):
+        updates["endpoint"] = f"{match.group(1)}:{match.group(2)}"
+    if match := re.search(r"\b(?:ll|linklocal|link-local|peer[_-]?link[_-]?local)\b[^0-9A-Fa-f]*?(fe80:[0-9A-Fa-f:]+)", text, re.IGNORECASE):
+        updates["peer_link_local"] = match.group(1)
+    if match := re.search(r"\b(?:node|target|region)\b[^A-Za-z0-9]*([A-Za-z0-9_-]+)\b", text, re.IGNORECASE):
+        node = _node_aliases().get(match.group(1).upper())
+        if node:
+            updates["target_node"] = node
+    if match := re.search(r"\b(?:asn|as)\b[^0-9]*(424242[0-9]{4})\b", text, re.IGNORECASE):
+        updates["asn"] = int(match.group(1))
+    if match := re.search(r"\b(?:pubkey|public[_-]?key|wg[_-]?key)\b[^A-Za-z0-9+/]*([A-Za-z0-9+/]{43}=)", text, re.IGNORECASE):
+        updates["public_key"] = match.group(1)
+
+    lowered = text.lower()
+    if not updates and lowered in {"cancel", "no", "n"}:
+        updates["_cancel"] = True
+    return updates
 
 
 @bot.message_handler(commands=["autopeer"], is_private_chat=True)
@@ -456,14 +500,39 @@ def handle_missing_field(parsed, field, message):
 
 
 def confirm_autopeer(chat_id, message):
-    pending = PENDING.pop(chat_id, None)
+    pending = PENDING.get(chat_id)
     if not pending:
         bot.send_message(message.chat.id, "No pending AutoPeer task.\n没有待确认的 AutoPeer 任务。", reply_markup=ReplyKeyboardRemove())
         return
-    if message.text.strip().lower() != "yes":
+    if message.text.strip() == "/cancel":
+        PENDING.pop(chat_id, None)
         bot.send_message(message.chat.id, "Cancelled.\n已取消。", reply_markup=ReplyKeyboardRemove())
         return
 
+    if message.text.strip().lower() != "yes":
+        updates = parse_pending_update(message.text)
+        if updates.get("_cancel"):
+            PENDING.pop(chat_id, None)
+            bot.send_message(message.chat.id, "Cancelled.\n已取消。", reply_markup=ReplyKeyboardRemove())
+            return
+        if not updates:
+            msg = bot.send_message(
+                message.chat.id,
+                "I did not understand the correction. Reply yes to deploy, or send a correction like listenport=36708, mtu=1380, endpoint=host:port.\n"
+                "没有识别到修正内容。回复 yes 部署，或发送 listenport=36708、mtu=1380、endpoint=host:port 这类修正。",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            bot.register_next_step_handler(msg, partial(confirm_autopeer, chat_id))
+            return
+
+        parsed = dict(pending["parsed"])
+        parsed.update({key: value for key, value in updates.items() if not key.startswith("_")})
+        PENDING.pop(chat_id, None)
+        bot.send_message(message.chat.id, "Correction received. Re-running dry-run...\n已收到修正，正在重新 dry-run。")
+        continue_autopeer_with_parsed(message, parsed)
+        return
+
+    PENDING.pop(chat_id, None)
     parsed = pending["parsed"]
     bot.send_message(message.chat.id, f"Deploying AutoPeer on {parsed['target_node']}...\n正在部署 AutoPeer...")
     result = tools.call_agent_action("autopeer_deploy", pending["payload"], parsed["target_node"], timeout=60)
