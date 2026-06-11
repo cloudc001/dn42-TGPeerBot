@@ -20,6 +20,7 @@ My bot is deployed at [@Cloudc001Bot](https://t.me/Cloudc001Bot). Welcome to pee
 - Uses a local DN42 registry cache for faster login email lookup.
 - Checks registry freshness once per minute and reclones when the local cache is behind.
 - Adds a per-user request guard: if a previous command has not replied yet, later messages from the same user are ignored until completion or timeout.
+- Adds per-user Telegram session logs in JSON Lines format.
 - Adds clearer whois failure handling during login.
 - Adds user-facing `/autopeer` dry-run and deploy workflow from free-form peer text.
 
@@ -145,6 +146,8 @@ In production, expose the agent API only to the bot server and protect it with a
 | `DN42_REGISTRY_ENABLED` | Enable local DN42 registry lookup. |
 | `DN42_REGISTRY_REPOS` | Registry clone sources, tried in order. |
 | `REQUEST_REPLY_TIMEOUT` | Per-message reply timeout in seconds. |
+| `TG_SESSION_LOG_ENABLED` | Enable per-user Telegram session logs. |
+| `TG_SESSION_LOG_DIR` | Directory used to store per-user Telegram session log files. |
 | `PRIVILEGE_CODE` | Optional operator privilege code. |
 | `AUTOPEER_DEFAULT_MTU` | Default MTU used by `/autopeer` when not provided. |
 | `AUTOPEER_USE_DEEPSEEK` | DeepSeek-first parsing switch. Local parser is fallback/supplement. |
@@ -183,11 +186,18 @@ When `DN42_REGISTRY_ENABLED = True`, the bot clones the DN42 registry locally an
 
 The server checks the remote registry HEAD once per minute. If the local clone is behind, the registry directory is recloned. If all remotes are unavailable, the current local cache remains available.
 
+### Telegram Session Logs
+
+When `TG_SESSION_LOG_ENABLED = True`, the server writes Telegram conversations to `TG_SESSION_LOG_DIR`. Each Telegram user gets a separate JSON Lines file, for example `user_123456789.log`. The log records incoming messages, outgoing bot messages, and internal cancel events such as ignored messages caused by the per-user request guard.
+
+These logs may contain verification codes, email addresses, peer configuration text, endpoints, and other user-provided data. Keep the log directory private and do not publish it.
+
 ### Security checklist before publishing
 
 - Do not commit `server/config.py`.
 - Do not commit `agent/agent_config.json`.
 - Do not commit Telegram bot tokens, SMTP passwords, API keys, SSH keys, WireGuard private keys, node root passwords, or runtime databases.
+- Do not commit Telegram session logs.
 - Keep only templates such as `server/config.example.py` and `deploy/node/dn42-agentctl.example.json`.
 - Use a dedicated SSH user and restricted sudo for the SSH backend.
 - Use strong shared secrets and firewall rules for the agent backend.
@@ -215,6 +225,7 @@ DN42-TGPeerBot 是一个面向 DN42 网络运营者的 Telegram 机器人。它�
 - 每分钟检查一次 registry 是否为最新版本；如果本地落后，则重新 clone。
 - 新增用户请求保护：同一用户上一条消息尚未产生回复时，不处理后续消息，直到完成或超时。
 - 登录时对 whois 故障给出更明确的错误提示。
+- 新增按 Telegram 用户分文件保存的 JSON Lines 会话日志。
 - 新增面向用户的 `/autopeer` 自由文本 dry-run 和确认部署流程。
 
 ### 架构
@@ -339,6 +350,8 @@ python main.py
 | `DN42_REGISTRY_ENABLED` | 是否启用本地 DN42 registry 查询。 |
 | `DN42_REGISTRY_REPOS` | registry clone 来源，按顺序尝试。 |
 | `REQUEST_REPLY_TIMEOUT` | 单条消息回复超时时间，单位秒。 |
+| `TG_SESSION_LOG_ENABLED` | 是否启用按用户分文件的 Telegram 会话日志。 |
+| `TG_SESSION_LOG_DIR` | Telegram 会话日志保存目录。 |
 | `PRIVILEGE_CODE` | 可选特权登录代码。 |
 | `AUTOPEER_DEFAULT_MTU` | `/autopeer` 未提供 MTU 时使用的默认值。 |
 | `AUTOPEER_USE_DEEPSEEK` | DeepSeek 优先解析开关；本地解析只做 fallback/补漏。 |
@@ -376,6 +389,12 @@ mtu 1420
 当 `DN42_REGISTRY_ENABLED = True` 时，机器人会在本地 clone DN42 registry，并优先从 registry 文件中查询登录邮箱。这通常比每次登录都查询 whois 更快、更稳定。
 
 服务端每分钟检查一次远端 registry HEAD。如果本地版本落后，会重新 clone registry 目录。如果远端暂时不可用，则保留并继续使用现有本地缓存。
+
+### Telegram 会话日志
+
+当 `TG_SESSION_LOG_ENABLED = True` 时，服务端会将 Telegram 会话写入 `TG_SESSION_LOG_DIR`。每个 Telegram 用户使用独立的 JSON Lines 文件，例如 `user_123456789.log`。日志会记录用户发来的消息、机器人发出的消息，以及被请求保护机制忽略等内部事件。
+
+这些日志可能包含验证码、邮箱地址、peer 配置文本、endpoint 以及其他用户提交的信息。请将日志目录作为私有运行数据保存，不要公开发布。
 
 ## 尝试一下
 

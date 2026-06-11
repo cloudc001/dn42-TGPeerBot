@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 
+import json
 import pickle
 import re
 import threading
 import time
+from datetime import datetime, timezone
+from pathlib import Path
 
 import base
 import commands  # noqa: F401
@@ -18,6 +21,232 @@ from base import bot, db, db_privilege
 from pytz import utc
 from telebot.handler_backends import BaseMiddleware, CancelUpdate
 from telebot.types import BotCommandScopeAllPrivateChats, ReplyKeyboardRemove
+
+
+class TelegramSessionLogger:
+    def __init__(self, bot_instance):
+        self.enabled = bool(getattr(config, "TG_SESSION_LOG_ENABLED", True))
+        self.log_dir = Path(str(getattr(config, "TG_SESSION_LOG_DIR", "./tg_session_logs")))
+        self._lock = threading.RLock()
+        self._local = threading.local()
+        self._original_send_message = bot_instance.send_message
+        self._original_reply_to = bot_instance.reply_to
+        self._original_edit_message_text = bot_instance.edit_message_text
+        if self.enabled:
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+            self._wrap_bot_methods(bot_instance)
+
+    @staticmethod
+    def _object_payload(obj):
+        if obj is None:
+            return None
+        try:
+            if hasattr(obj, "to_dict"):
+                return obj.to_dict()
+        except BaseException:
+            pass
+        try:
+            if hasattr(obj, "json"):
+                raw_json = obj.json
+                if isinstance(raw_json, str):
+                    return json.loads(raw_json)
+                return raw_json
+        except BaseException:
+            pass
+        try:
+            return vars(obj)
+        except BaseException:
+            return str(obj)
+
+    @staticmethod
+    def _user_payload(user):
+        if not user:
+            return None
+        return {
+            "id": getattr(user, "id", None),
+            "is_bot": getattr(user, "is_bot", None),
+            "username": getattr(user, "username", None),
+            "first_name": getattr(user, "first_name", None),
+            "last_name": getattr(user, "last_name", None),
+            "full_name": getattr(user, "full_name", None),
+            "language_code": getattr(user, "language_code", None),
+        }
+
+    @staticmethod
+    def _chat_payload(chat):
+        if not chat:
+            return None
+        return {
+            "id": getattr(chat, "id", None),
+            "type": getattr(chat, "type", None),
+            "title": getattr(chat, "title", None),
+            "username": getattr(chat, "username", None),
+            "first_name": getattr(chat, "first_name", None),
+            "last_name": getattr(chat, "last_name", None),
+        }
+
+    @staticmethod
+    def _safe_filename(value):
+        return re.sub(r"[^0-9A-Za-z_.-]+", "_", str(value))
+
+    def _target_id(self, *, user_id=None, chat_id=None):
+        if user_id is not None:
+            return f"user_{self._safe_filename(user_id)}"
+        context_user = getattr(self._local, "user_id", None)
+        if context_user is not None:
+            return f"user_{self._safe_filename(context_user)}"
+        if chat_id is not None:
+            return f"chat_{self._safe_filename(chat_id)}"
+        context_chat = getattr(self._local, "chat_id", None)
+        if context_chat is not None:
+            return f"chat_{self._safe_filename(context_chat)}"
+        return "unknown"
+
+    def _write(self, target, entry):
+        if not self.enabled:
+            return
+        entry["ts"] = datetime.now(timezone.utc).isoformat()
+        path = self.log_dir / f"{target}.log"
+        try:
+            line = json.dumps(entry, ensure_ascii=False, default=str, separators=(",", ":"))
+            with self._lock:
+                self.log_dir.mkdir(parents=True, exist_ok=True)
+                with path.open("a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+        except BaseException:
+            pass
+
+    def set_context(self, message):
+        user = getattr(message, "from_user", None)
+        chat = getattr(message, "chat", None)
+        if not chat and getattr(message, "message", None):
+            chat = getattr(message.message, "chat", None)
+        self._local.user_id = getattr(user, "id", None)
+        self._local.chat_id = getattr(chat, "id", None)
+
+    def clear_context(self):
+        self._local.user_id = None
+        self._local.chat_id = None
+
+    def log_incoming(self, message):
+        if not self.enabled:
+            return
+        user = getattr(message, "from_user", None)
+        chat = getattr(message, "chat", None)
+        target = self._target_id(user_id=getattr(user, "id", None), chat_id=getattr(chat, "id", None))
+        self._write(
+            target,
+            {
+                "direction": "incoming",
+                "kind": "message",
+                "message_id": getattr(message, "message_id", None),
+                "content_type": getattr(message, "content_type", None),
+                "text": getattr(message, "text", None),
+                "caption": getattr(message, "caption", None),
+                "from_user": self._user_payload(user),
+                "chat": self._chat_payload(chat),
+                "raw": self._object_payload(message),
+            },
+        )
+
+    def log_event(self, message, event, detail=None):
+        if not self.enabled:
+            return
+        user = getattr(message, "from_user", None)
+        chat = getattr(message, "chat", None)
+        target = self._target_id(user_id=getattr(user, "id", None), chat_id=getattr(chat, "id", None))
+        self._write(
+            target,
+            {
+                "direction": "internal",
+                "kind": event,
+                "detail": detail,
+                "from_user": self._user_payload(user),
+                "chat": self._chat_payload(chat),
+            },
+        )
+
+    def log_callback(self, call):
+        if not self.enabled:
+            return
+        user = getattr(call, "from_user", None)
+        message = getattr(call, "message", None)
+        chat = getattr(message, "chat", None)
+        target = self._target_id(user_id=getattr(user, "id", None), chat_id=getattr(chat, "id", None))
+        self._write(
+            target,
+            {
+                "direction": "incoming",
+                "kind": "callback_query",
+                "id": getattr(call, "id", None),
+                "data": getattr(call, "data", None),
+                "message_id": getattr(message, "message_id", None),
+                "from_user": self._user_payload(user),
+                "chat": self._chat_payload(chat),
+                "raw": self._object_payload(call),
+            },
+        )
+
+    def log_outgoing(self, method, chat_id=None, payload=None):
+        if not self.enabled:
+            return
+        target = self._target_id(chat_id=chat_id)
+        self._write(
+            target,
+            {
+                "direction": "outgoing",
+                "kind": method,
+                "chat_id": chat_id,
+                "payload": payload or {},
+            },
+        )
+
+    def _wrap_bot_methods(self, bot_instance):
+        def send_message(chat_id, text, *args, **kwargs):
+            self.log_outgoing(
+                "send_message",
+                chat_id=chat_id,
+                payload={"text": text, "args": args, "kwargs": kwargs},
+            )
+            return self._original_send_message(chat_id, text, *args, **kwargs)
+
+        def reply_to(message, text, *args, **kwargs):
+            self.log_outgoing(
+                "reply_to",
+                chat_id=getattr(getattr(message, "chat", None), "id", None),
+                payload={
+                    "reply_to_message_id": getattr(message, "message_id", None),
+                    "text": text,
+                    "args": args,
+                    "kwargs": kwargs,
+                },
+            )
+            return self._original_reply_to(message, text, *args, **kwargs)
+
+        def edit_message_text(text, chat_id=None, message_id=None, inline_message_id=None, *args, **kwargs):
+            self.log_outgoing(
+                "edit_message_text",
+                chat_id=chat_id,
+                payload={
+                    "text": text,
+                    "message_id": message_id,
+                    "inline_message_id": inline_message_id,
+                    "args": args,
+                    "kwargs": kwargs,
+                },
+            )
+            return self._original_edit_message_text(
+                text,
+                chat_id=chat_id,
+                message_id=message_id,
+                inline_message_id=inline_message_id,
+                *args,
+                **kwargs,
+            )
+
+        bot_instance.send_message = send_message
+        bot_instance.reply_to = reply_to
+        bot_instance.edit_message_text = edit_message_text
 
 
 class RequestGuard:
@@ -187,6 +416,7 @@ class IsForMe(telebot.custom_filters.SimpleCustomFilter):
             return True
 
 
+session_logger = TelegramSessionLogger(bot)
 request_guard = RequestGuard(bot, timeout=int(getattr(config, "REQUEST_REPLY_TIMEOUT", 5)))
 
 
@@ -197,13 +427,21 @@ class MyMiddleware(BaseMiddleware):
     def pre_process(self, message, data):
         data["sentry_transaction"] = None
         data["request_guard_active"] = False
+        session_logger.set_context(message)
+        session_logger.log_incoming(message)
         if not message.text:
+            session_logger.log_event(message, "cancel_update", "message has no text")
+            session_logger.clear_context()
             return CancelUpdate()
         command = message.text.split()[0].split("@")
         if len(command) > 1:
             if command[-1].lower() != bot.get_me().username.lower():
+                session_logger.log_event(message, "cancel_update", "command addressed to another bot")
+                session_logger.clear_context()
                 return CancelUpdate()
         if not request_guard.begin(message):
+            session_logger.log_event(message, "cancel_update", "previous request is still pending")
+            session_logger.clear_context()
             return CancelUpdate()
         data["request_guard_active"] = True
         if config.SENTRY_DSN and command[0].startswith("/"):
@@ -262,6 +500,19 @@ class MyMiddleware(BaseMiddleware):
             pass
         if data.get("request_guard_active"):
             request_guard.finish(message)
+        session_logger.clear_context()
+
+
+class CallbackLogMiddleware(BaseMiddleware):
+    def __init__(self):
+        self.update_types = ["callback_query"]
+
+    def pre_process(self, call, data):
+        session_logger.set_context(call)
+        session_logger.log_callback(call)
+
+    def post_process(self, call, data, exception):
+        session_logger.clear_context()
 
 
 # Startup and initialization
@@ -314,6 +565,7 @@ scheduler.start()
 # Setup bot
 bot.add_custom_filter(IsPrivateChat())
 bot.setup_middleware(MyMiddleware())
+bot.setup_middleware(CallbackLogMiddleware())
 
 cmd_list = {
     "ping": ("Ping IP / Domain", True),

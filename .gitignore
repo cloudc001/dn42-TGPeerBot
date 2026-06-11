@@ -10,6 +10,7 @@ id_*
 server/*.pkl
 server/autopeer_pending.json
 server/dn42-registry/
+server/tg_session_logs/
 *.log
 
 # Python cache and virtual environments
