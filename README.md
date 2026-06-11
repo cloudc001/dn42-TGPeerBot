@@ -21,7 +21,7 @@ My bot is deployed at [@Cloudc001Bot](https://t.me/Cloudc001Bot). Welcome to pee
 - Checks registry freshness once per minute and reclones when the local cache is behind.
 - Adds a per-user request guard: if a previous command has not replied yet, later messages from the same user are ignored until completion or timeout.
 - Adds clearer whois failure handling during login.
-- Adds privileged `/autopeer` dry-run, deploy, and rollback workflow.
+- Adds user-facing `/autopeer` dry-run and deploy workflow from free-form peer text.
 
 ### Architecture
 
@@ -43,7 +43,7 @@ The SSH backend is recommended for small VPS nodes because it does not require a
 - User login by DN42 ASN and registry email verification.
 - Privileged login code for operator-controlled access.
 - Peer creation, modification, removal, restart, and status query.
-- Privileged AutoPeer workflow from free-form peer text.
+- AutoPeer workflow from free-form peer text. Logged-in users can create peers only for their own ASN; privileged users can operate on behalf of another ASN.
 - Multi-node peer selection and node availability checks.
 - WireGuard and BIRD configuration generation.
 - DN42 tools: ping, tcping, traceroute, route lookup, AS path lookup, whois, dig, and NS lookup.
@@ -153,7 +153,7 @@ In production, expose the agent API only to the bot server and protect it with a
 
 ### AutoPeer
 
-`/autopeer` is a privileged Telegram command. It accepts free-form peer information, extracts a strict internal schema, performs node-side dry-run validation, and only deploys after explicit confirmation.
+`/autopeer` is available to logged-in users. It accepts free-form peer information, extracts a strict internal schema, performs node-side dry-run validation, and only deploys after explicit confirmation. Non-privileged users can only create peers for their own verified ASN; privileged users can operate on behalf of another ASN.
 
 Example:
 
@@ -172,8 +172,8 @@ Workflow:
 2. Validate required fields and value ranges.
 3. Call the target node's fixed `dn42-agentctl autopeer_dryrun` action.
 4. Show generated WireGuard and BIRD config, target paths, commands, and conflicts.
-5. Deploy only after the operator replies `yes`.
-6. Roll back the latest AutoPeer on a node with `/autopeer rollback <node>`.
+5. Deploy only after the user replies `yes`.
+6. Delete AutoPeer-created peers through the normal `/remove` command. `/remove` only removes peers for the user's currently logged-in ASN.
 
 When `AUTOPEER_USE_DEEPSEEK = True` and `DEEPSEEK_API_KEY` is available in the environment, `/autopeer` sends free-form peer text to DeepSeek first. The local parser is used only when DeepSeek is unavailable or when DeepSeek leaves fields empty. The model output is never executed directly; deployment is still performed by deterministic schema validation and node-side fixed actions.
 
@@ -215,7 +215,7 @@ DN42-TGPeerBot 是一个面向 DN42 网络运营者的 Telegram 机器人。它�
 - 每分钟检查一次 registry 是否为最新版本；如果本地落后，则重新 clone。
 - 新增用户请求保护：同一用户上一条消息尚未产生回复时，不处理后续消息，直到完成或超时。
 - 登录时对 whois 故障给出更明确的错误提示。
-- 新增管理员 `/autopeer` dry-run、确认部署和回滚流程。
+- 新增面向用户的 `/autopeer` 自由文本 dry-run 和确认部署流程。
 
 ### 架构
 
@@ -237,7 +237,7 @@ Telegram Bot Server
 - 基于 DN42 ASN 和 registry 邮箱验证码登录。
 - 支持特权代码登录。
 - 创建、修改、删除、重启和查看 peer。
-- 管理员可通过自由文本 AutoPeer 创建 peer。
+- AutoPeer 支持从自由文本创建 peer。普通登录用户只能为自己的 ASN 创建，管理员可代操作其他 ASN。
 - 支持多节点选择和节点可用性检查。
 - 生成 WireGuard 和 BIRD 配置。
 - DN42 工具：ping、tcping、traceroute、route lookup、AS path lookup、whois、dig、NS lookup。
@@ -347,7 +347,7 @@ python main.py
 
 ### AutoPeer
 
-`/autopeer` 是管理员命令。它可以接收自由格式 peer 信息，提取严格结构，调用节点侧 dry-run 校验，并且只有管理员明确回复 `yes` 后才会部署。
+`/autopeer` 面向已登录用户开放。它可以接收自由格式 peer 信息，提取严格结构，调用节点侧 dry-run 校验，并且只有用户明确回复 `yes` 后才会部署。普通用户只能为自己已验证登录的 ASN 创建 peer；管理员可代操作其他 ASN。
 
 示例：
 
@@ -366,8 +366,8 @@ mtu 1420
 2. 校验必填字段和值范围。
 3. 调用目标节点固定动作 `dn42-agentctl autopeer_dryrun`。
 4. 展示将生成的 WireGuard/BIRD 配置、目标路径、将执行的命令和冲突信息。
-5. 管理员回复 `yes` 后才执行部署。
-6. 使用 `/autopeer rollback <节点>` 回滚某节点最近一次 AutoPeer。
+5. 用户回复 `yes` 后才执行部署。
+6. AutoPeer 创建的 peer 统一通过普通 `/remove` 命令删除。`/remove` 只会删除当前登录 ASN 的 peer。
 
 当 `AUTOPEER_USE_DEEPSEEK = True` 且环境变量中存在 `DEEPSEEK_API_KEY` 时，`/autopeer` 会先把自由格式 peer 文本交给 DeepSeek 解析。本地解析只在 DeepSeek 不可用或字段为空时做 fallback/补漏。模型输出不会被直接执行，部署仍由严格 schema 校验和节点侧固定动作完成。
 

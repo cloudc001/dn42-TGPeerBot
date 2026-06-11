@@ -327,6 +327,7 @@ cmd_list = {
     "logout": ("Logout current logged ASN 退出当前登录的 ASN", False),
     "whoami": ("Get current login user 获取当前登录用户", False),
     "peer": ("Set up a peer 设置一个 Peer", False),
+    "autopeer": ("Create a peer from free-form info 从自由文本创建 Peer", False),
     "modify": ("Modify peer information 修改 Peer 信息", False),
     "remove": ("Remove a peer 移除一个 Peer", False),
     "info": ("Show your peer info and status 查看你的 Peer 信息及状态", False),

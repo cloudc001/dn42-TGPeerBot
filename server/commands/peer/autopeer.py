@@ -8,7 +8,7 @@ from ipaddress import IPv6Network, ip_address
 import config
 import requests
 import tools
-from base import bot, db_privilege
+from base import bot, db, db_privilege
 from telebot.types import ReplyKeyboardRemove
 
 
@@ -335,6 +335,25 @@ def _contact_for(message, asn):
     return tools.get_whoisinfo_by_asn(asn)
 
 
+def _can_manage_autopeer(message, parsed):
+    if message.chat.id in db_privilege:
+        return True
+    if message.chat.id not in db:
+        tools.gen_login_message(message)
+        return False
+    if int(parsed["asn"]) != int(db[message.chat.id]):
+        bot.send_message(
+            message.chat.id,
+            (
+                f"You are logged in as AS{db[message.chat.id]}, so /autopeer can only create peers for AS{db[message.chat.id]}.\n"
+                f"你当前登录的是 AS{db[message.chat.id]}，因此 /autopeer 只能为 AS{db[message.chat.id]} 创建 Peer。"
+            ),
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return False
+    return True
+
+
 def build_peer_payload(parsed, local_link_local, contact):
     asn = parsed["asn"]
     return {
@@ -438,18 +457,20 @@ def parse_pending_update(text):
 
 @bot.message_handler(commands=["autopeer"], is_private_chat=True)
 def start_autopeer(message):
-    if message.chat.id not in db_privilege:
-        bot.send_message(
-            message.chat.id,
-            f"/autopeer is restricted. Please contact {config.CONTACT}.\n/autopeer 仅限管理员使用，请联系 {config.CONTACT}。",
-            reply_markup=ReplyKeyboardRemove(),
-        )
+    if message.chat.id not in db and message.chat.id not in db_privilege:
+        tools.gen_login_message(message)
         return
 
     parts = message.text.split(maxsplit=2)
-    if len(parts) >= 2 and parts[1].lower() == "rollback":
-        node = parts[2].strip() if len(parts) >= 3 else ""
-        rollback_autopeer(message, node)
+    if len(parts) >= 2 and parts[1].lower() in {"rollback", "remove", "delete"}:
+        bot.send_message(
+            message.chat.id,
+            (
+                "AutoPeer deletion is handled by /remove now. It will only remove peers for your logged-in ASN.\n"
+                "AutoPeer 删除现在统一通过 /remove 处理，并且只会删除你当前登录 ASN 的 Peer。"
+            ),
+            reply_markup=ReplyKeyboardRemove(),
+        )
         return
 
     text = message.text.partition(" ")[2].strip()
@@ -495,6 +516,8 @@ def continue_autopeer_with_parsed(message, parsed):
             + "\n\nUse /autopeer again with complete peer information.",
             reply_markup=ReplyKeyboardRemove(),
         )
+        return
+    if not _can_manage_autopeer(message, parsed):
         return
 
     pre = tools.call_agent_action("pre_peer", "", parsed["target_node"], timeout=12)

@@ -95,10 +95,11 @@ CN_WHITELIST_IP = ["8.8.8.8", "2001:4860:4860::8888"]
 SENTRY_DSN = None
 
 # AutoPeer settings.
-# /autopeer is restricted to privileged users by default. When DEEPSEEK_API_KEY
-# is set and AUTOPEER_USE_DEEPSEEK is True, free-form input is sent to DeepSeek
-# first. The local parser is then used only as fallback/supplement, and the
-# final result is still strictly validated before dry-run/deploy.
+# /autopeer is available to logged-in users, but non-privileged users may only
+# create peers for their own verified ASN. When DEEPSEEK_API_KEY is set and
+# AUTOPEER_USE_DEEPSEEK is True, free-form input is sent to DeepSeek first.
+# The local parser is then used only as fallback/supplement, and the final
+# result is still strictly validated before dry-run/deploy.
 AUTOPEER_DEFAULT_MTU = 1420
 AUTOPEER_USE_DEEPSEEK = True
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
