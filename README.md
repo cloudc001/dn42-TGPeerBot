@@ -159,10 +159,10 @@ Example:
 
 ```text
 /autopeer add HK
-asn 4242421260
-405218.xyz:60103
-public key 9zsuhOiSC8rKsdUNtX678wh3rTo4McJ9ueDqm1Ha8wI=
-ll fe80::9527
+asn 4242423777
+sg.dn42.cloudc.dev:52257
+public key EPgqX4UDrzirYgPbDf3t6+6XBWozuUEg4L2zWcPO5Xk=
+ll fe80::1234
 mtu 1420
 ```
 
@@ -353,10 +353,10 @@ python main.py
 
 ```text
 /autopeer add HK
-asn 4242421260
-405218.xyz:60103
-public key 9zsuhOiSC8rKsdUNtX678wh3rTo4McJ9ueDqm1Ha8wI=
-ll fe80::9527
+asn 4242423777
+sg.dn42.cloudc.dev:52257
+public key EPgqX4UDrzirYgPbDf3t6+6XBWozuUEg4L2zWcPO5Xk=
+ll fe80::1234
 mtu 1420
 ```
 
